@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "check": "node --check server.mjs && node --check public/app.js",
     "start": "node server.mjs"
   }
 }

@@ -10,7 +10,7 @@ const skillEnvFile = "/Users/chengzhihua/.codex/skills/vsllm-image/.env";
 const defaultPort = Number(process.env.PORT || 4173);
 
 const DEFAULT_API_BASE = "https://vsllm.com/v1";
-const DEFAULT_IMAGE_MODEL = "gpt-image-2-chat-priority";
+const DEFAULT_IMAGE_MODEL = "gpt-image-2-chat";
 const DEFAULT_TOOL_MODEL = "gpt-image-2";
 const DEFAULT_ENHANCE_MODEL = "deepseek-v4-pro";
 
@@ -583,11 +583,12 @@ async function route(req, res) {
         hasKey: Boolean(cfg.apiKey),
         apiBase: cfg.baseUrl,
         imageModel: cfg.imageModel,
+        defaultModel: DEFAULT_IMAGE_MODEL,
         toolModel: cfg.toolModel,
         enhanceModel: cfg.enhanceModel,
         models: [
-          { id: "gpt-image-2-chat-priority", name: "高速生成", desc: "推荐通道 · 更快更稳 · 成本更高", premium: true },
-          { id: "gpt-image-2-chat", name: "标准生成", desc: "经济通道 · 适合日常草稿", premium: false },
+          { id: "gpt-image-2-chat", name: "标准生成", desc: "默认通道 · 适合日常草稿", premium: false },
+          { id: "gpt-image-2-chat-priority", name: "高速生成", desc: "加速通道 · 更快更稳 · 成本更高", premium: true },
         ],
       });
       return;

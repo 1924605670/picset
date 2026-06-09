@@ -1,0 +1,106 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - feat/picset-private-push
+  workflow_dispatch:
+
+concurrency:
+  group: picset-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: picset
+  APP_PORT: "4173"
+  DEPLOY_DIR: /opt/picset
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run syntax checks
+        run: npm run check
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check deployment secrets
+        id: deployment_secrets
+        env:
+          TENCENT_HOST: ${{ secrets.TENCENT_HOST }}
+          TENCENT_USER: ${{ secrets.TENCENT_USER }}
+          TENCENT_PASSWORD: ${{ secrets.TENCENT_PASSWORD }}
+        run: |
+          if [ -n "$TENCENT_HOST" ] && [ -n "$TENCENT_USER" ] && [ -n "$TENCENT_PASSWORD" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Deployment secrets are incomplete; skipping deployment."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release archive
+        if: steps.deployment_secrets.outputs.ready == 'true'
+        run: |
+          tar \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            --exclude='node_modules' \
+            --exclude='npm-debug.log*' \
+            --exclude='yarn-debug.log*' \
+            --exclude='yarn-error.log*' \
+            -czf /tmp/picset-release.tgz .
+
+      - name: Install SSH tooling
+        if: steps.deployment_secrets.outputs.ready == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Trust server host key
+        if: steps.deployment_secrets.outputs.ready == 'true'
+        env:
+          TENCENT_HOST: ${{ secrets.TENCENT_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$TENCENT_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload release
+        if: steps.deployment_secrets.outputs.ready == 'true'
+        env:
+          SSHPASS: ${{ secrets.TENCENT_PASSWORD }}
+          TENCENT_HOST: ${{ secrets.TENCENT_HOST }}
+          TENCENT_USER: ${{ secrets.TENCENT_USER }}
+        run: |
+          sshpass -e ssh "$TENCENT_USER@$TENCENT_HOST" "rm -rf /tmp/picset-release && mkdir -p /tmp/picset-release"
+          sshpass -e scp /tmp/picset-release.tgz "$TENCENT_USER@$TENCENT_HOST:/tmp/picset-release/release.tgz"
+          sshpass -e ssh "$TENCENT_USER@$TENCENT_HOST" "tar -xzf /tmp/picset-release/release.tgz -C /tmp/picset-release"
+
+      - name: Activate release
+        if: steps.deployment_secrets.outputs.ready == 'true'
+        env:
+          SSHPASS: ${{ secrets.TENCENT_PASSWORD }}
+          TENCENT_HOST: ${{ secrets.TENCENT_HOST }}
+          TENCENT_USER: ${{ secrets.TENCENT_USER }}
+          PICSET_ENV_B64: ${{ secrets.PICSET_ENV_B64 }}
+        run: |
+          sshpass -e ssh "$TENCENT_USER@$TENCENT_HOST" \
+            "APP_NAME='$APP_NAME' APP_PORT='$APP_PORT' DEPLOY_DIR='$DEPLOY_DIR' PICSET_ENV_B64='$PICSET_ENV_B64' SUDO_PASSWORD='$SSHPASS' bash /tmp/picset-release/scripts/deploy_remote.sh"

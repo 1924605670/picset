@@ -9,7 +9,7 @@ const state = {
   config: null,
   settings: {
     apiBase: "",
-    model: "gpt-image-2-chat-priority",
+    model: "gpt-image-2-chat",
     timeoutMs: 0,
     retries: 1,
   },
@@ -38,7 +38,7 @@ const examples = [
 ];
 
 const MODEL_LABELS = {
-  "gpt-image-2-chat-priority": { name: "高速生成", desc: "推荐通道 · 更快更稳 · 成本更高" },
+  "gpt-image-2-chat-priority": { name: "高速生成", desc: "加速通道 · 更快更稳 · 成本更高" },
   "gpt-image-2-chat": { name: "标准生成", desc: "经济通道 · 适合日常草稿" },
 };
 
@@ -223,7 +223,7 @@ function renderConversationList() {
       state.currentConversationId = conv.id;
       state.pendingImages = [];
       renderAll();
-      $("#sidebar").classList.remove("open");
+      setSidebarOpen(false);
     };
     list.appendChild(btn);
   }
@@ -534,8 +534,8 @@ function renderPendingImages() {
 
 function renderModelMenu() {
   const models = state.config?.models || [
-    { id: "gpt-image-2-chat-priority", name: "高速生成", desc: "推荐通道 · 更快更稳", premium: true },
-    { id: "gpt-image-2-chat", name: "标准生成", desc: "经济通道 · 适合日常草稿", premium: false }
+    { id: "gpt-image-2-chat", name: "标准生成", desc: "默认通道 · 适合日常草稿", premium: false },
+    { id: "gpt-image-2-chat-priority", name: "高速生成", desc: "加速通道 · 更快更稳", premium: true },
   ];
   $("#current-model").textContent = modelLabel(state.settings.model).name;
   const menu = $("#model-menu");
@@ -577,8 +577,19 @@ function loadSettingsLocal() {
 function autoresizePrompt() {
   const input = $("#prompt-input");
   input.style.height = "auto";
-  input.style.height = `${Math.min(input.scrollHeight, 190)}px`;
+  const isNarrow = window.matchMedia("(max-width: 640px)").matches;
+  input.style.height = `${Math.min(input.scrollHeight, isNarrow ? 128 : 190)}px`;
   updateSendAffordance();
+}
+
+function setAppViewportHeight() {
+  const height = window.visualViewport?.height || window.innerHeight;
+  document.documentElement.style.setProperty("--app-height", `${Math.round(height)}px`);
+}
+
+function setSidebarOpen(open) {
+  $("#sidebar").classList.toggle("open", open);
+  document.body.classList.toggle("sidebar-open", open);
 }
 
 function updateSendAffordance() {
@@ -1673,7 +1684,8 @@ function bindEvents() {
   $("#folder-name-input").addEventListener("keydown", (event) => {
     if (event.key === "Enter") $("#confirm-create-folder-btn").click();
   });
-  $("#toggle-sidebar-btn").onclick = () => $("#sidebar").classList.toggle("open");
+  $("#toggle-sidebar-btn").onclick = () => setSidebarOpen(!$("#sidebar").classList.contains("open"));
+  $("#sidebar-scrim").onclick = () => setSidebarOpen(false);
   $("#favorites-toggle").onclick = () => $("#favorites-list").classList.toggle("collapsed");
   $("#clear-gallery-btn").onclick = async () => {
     if (!confirm("清空图库？")) return;
@@ -1750,6 +1762,7 @@ function bindEvents() {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       for (const id of ["settings-modal", "gallery-picker-modal", "folder-picker-modal", "folder-create-modal", "storyboard-modal", "edit-modal", "mark-modal", "assets-modal"]) closeModal(id);
+      setSidebarOpen(false);
       for (const [msgId, controller] of state.activeTasks) {
         const msg = state.messages.find((item) => item.id === msgId);
         if (msg?.status === "pending") {
@@ -1759,8 +1772,17 @@ function bindEvents() {
       }
     }
     if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "n") createConversation();
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") $("#sidebar").classList.toggle("open");
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") setSidebarOpen(!$("#sidebar").classList.contains("open"));
   });
+  window.addEventListener("resize", () => {
+    setAppViewportHeight();
+    autoresizePrompt();
+  });
+  window.visualViewport?.addEventListener("resize", () => {
+    setAppViewportHeight();
+    autoresizePrompt();
+  });
+  window.visualViewport?.addEventListener("scroll", setAppViewportHeight);
 }
 
 async function initConfig() {
@@ -1768,7 +1790,7 @@ async function initConfig() {
   state.config = await res.json();
   if (!state.settings.apiBase) state.settings.apiBase = "";
   if (!localStorage.getItem("imageWorkbenchSettings") && !localStorage.getItem("vsllmCloneSettings")) {
-    state.settings.model = state.config.imageModel || state.settings.model;
+    state.settings.model = state.config.defaultModel || state.config.imageModel || state.settings.model;
   }
   const status = $("#api-status");
   status.textContent = state.config.hasKey ? "配置可用" : "缺少密钥";
@@ -1777,6 +1799,7 @@ async function initConfig() {
 }
 
 async function init() {
+  setAppViewportHeight();
   loadSettingsLocal();
   bindEvents();
   state.db = await openDb();
