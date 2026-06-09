@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>图像创作台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand-row">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div>
+          <div class="brand-title">图像创作台</div>
+          <div class="brand-subtitle">本地创作工作区</div>
+        </div>
+      </div>
+
+      <section class="side-section">
+        <div class="side-head">
+          <span>创作记录</span>
+          <button class="icon-text-btn" id="new-conversation-btn" type="button" title="新建记录">＋ 新建</button>
+        </div>
+        <div class="conversation-list" id="conversation-list"></div>
+      </section>
+
+      <section class="side-section compact">
+        <button class="side-toggle" id="favorites-toggle" type="button">
+          <span>提示词库</span>
+          <span id="favorites-count"></span>
+        </button>
+        <div class="favorites-list collapsed" id="favorites-list"></div>
+      </section>
+
+      <section class="side-section gallery-section">
+        <div class="side-head">
+          <span>作品库</span>
+          <div class="side-actions">
+            <button class="ghost-mini" id="new-folder-btn" type="button">新文件夹</button>
+            <button class="ghost-mini" id="clear-gallery-btn" type="button">清空</button>
+          </div>
+        </div>
+        <div class="folder-list" id="folder-list"></div>
+        <div class="gallery-grid" id="gallery-grid"></div>
+      </section>
+
+      <section class="side-section compact">
+        <div class="side-head">
+          <span>一致性素材</span>
+          <button class="ghost-mini" id="open-assets-btn" type="button">管理</button>
+        </div>
+        <div class="asset-hint">用 @名称 复用角色、场景或道具描述。</div>
+      </section>
+    </aside>
+
+    <main class="main-panel">
+      <header class="topbar">
+        <button class="mobile-sidebar-btn" id="toggle-sidebar-btn" type="button" title="切换侧边栏">☰</button>
+        <div class="workspace-title">
+          <strong>创作面板</strong>
+          <span>生成 · 编辑 · 标注 · 重试</span>
+        </div>
+        <div class="model-select-wrap">
+          <button class="model-button" id="model-button" type="button">
+            <span id="current-model">高速生成</span>
+            <span class="chev">⌄</span>
+          </button>
+          <div class="model-menu hidden" id="model-menu"></div>
+        </div>
+        <div class="api-status" id="api-status">配置检查中</div>
+        <button class="toolbar-btn" id="open-settings-btn" type="button" title="偏好设置">偏好</button>
+      </header>
+
+      <section class="chat-scroll" id="chat-scroll"></section>
+
+      <footer class="composer-wrap">
+        <div class="reference-strip hidden" id="reference-strip"></div>
+        <div class="composer">
+          <div class="composer-toolbar">
+            <button class="seg-btn" id="toggle-seed-btn" type="button">种子 <span id="seed-label">无</span></button>
+            <button class="seg-btn" id="toggle-params-btn" type="button">参数 <span id="params-label">auto · high · png</span></button>
+            <button class="tool-chip" id="enhance-btn" type="button">优化提示词</button>
+            <button class="tool-chip accent-chip" id="storyboard-btn" type="button">连续出图</button>
+            <button class="tool-chip" id="upload-image-btn" type="button">上传参考</button>
+            <button class="tool-chip" id="pick-gallery-btn" type="button">选择作品</button>
+            <input id="image-file-input" type="file" accept="image/*" multiple hidden>
+          </div>
+
+          <div class="option-row prompt-options">
+            <button class="option-chip" data-insert-target="prompt-input" data-insert="写实摄影，真实自然光，浅景深，细腻质感" type="button">写实摄影</button>
+            <button class="option-chip" data-insert-target="prompt-input" data-insert="电影感构图，低角度镜头，层次丰富的光影，情绪氛围强" type="button">电影镜头</button>
+            <button class="option-chip" data-insert-target="prompt-input" data-insert="产品主图，干净背景，高级材质，商业广告布光" type="button">产品主图</button>
+            <button class="option-chip" data-insert-target="prompt-input" data-insert="角色设定图，完整服装细节，正面视角，清晰轮廓" type="button">角色设定</button>
+            <button class="option-chip" data-insert-target="prompt-input" data-insert="统一色调，主体清晰，背景不过度抢眼，画面干净" type="button">画面稳定</button>
+          </div>
+
+          <div class="seed-row hidden" id="seed-row">
+            <button class="seed-option active" data-seed="0" type="button">无</button>
+            <button class="seed-option" data-seed="1" type="button">1</button>
+            <button class="seed-option" data-seed="2" type="button">2</button>
+            <button class="seed-option" data-seed="3" type="button">3</button>
+            <button class="seed-option" data-seed="4" type="button">4</button>
+            <button class="seed-option" data-seed="5" type="button">5</button>
+            <input id="custom-seed" class="seed-input" type="number" min="0" max="999999" placeholder="自定义">
+          </div>
+
+          <div class="params-row hidden" id="params-row">
+            <label>尺寸
+              <select id="param-size">
+                <option value="auto">auto</option>
+                <option value="1024x1024">1024×1024</option>
+                <option value="1024x1536">1024×1536</option>
+                <option value="1536x1024">1536×1024</option>
+                <option value="2048x2048">2048×2048</option>
+                <option value="1152x2048">1152×2048</option>
+                <option value="2048x1152">2048×1152</option>
+                <option value="2160x3840">2160×3840</option>
+                <option value="3840x2160">3840×2160</option>
+              </select>
+            </label>
+            <label>质量
+              <select id="param-quality">
+                <option value="high">high</option>
+                <option value="auto">auto</option>
+                <option value="medium">medium</option>
+                <option value="low">low</option>
+              </select>
+            </label>
+            <label>格式
+              <select id="param-format">
+                <option value="png">png</option>
+                <option value="jpeg">jpeg</option>
+                <option value="webp">webp</option>
+              </select>
+            </label>
+            <label>思考
+              <select id="param-reasoning">
+                <option value="off">关闭</option>
+                <option value="low">低</option>
+                <option value="medium">中</option>
+                <option value="high">高</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="composer-main">
+            <textarea id="prompt-input" rows="1" placeholder="描述画面或编辑目标，例如：一只白色小猫坐在窗边，清晨柔和阳光，浅景深"></textarea>
+            <button class="send-btn" id="send-btn" type="button">生成</button>
+          </div>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <div class="modal-backdrop hidden" id="settings-modal">
+    <div class="modal-panel settings-panel">
+      <div class="modal-head">
+        <h2>创作偏好</h2>
+        <button class="close-btn" data-close="settings-modal" type="button">×</button>
+      </div>
+      <div class="settings-grid">
+        <label>API Base
+          <input id="setting-api-base" type="text" placeholder="从 env 读取">
+        </label>
+        <label>生成通道
+          <select id="setting-model"></select>
+        </label>
+        <label>超时
+          <select id="setting-timeout">
+            <option value="0">永不</option>
+            <option value="300000">5 分钟</option>
+            <option value="600000">10 分钟</option>
+            <option value="900000">15 分钟</option>
+            <option value="1800000">30 分钟</option>
+          </select>
+        </label>
+        <label>失败重试
+          <select id="setting-retries">
+            <option value="0">0 次</option>
+            <option value="1">1 次</option>
+            <option value="2">2 次</option>
+            <option value="3">3 次</option>
+          </select>
+        </label>
+      </div>
+      <div class="modal-note" id="settings-note"></div>
+      <div class="modal-actions">
+        <button class="secondary-btn" data-close="settings-modal" type="button">取消</button>
+        <button class="primary-btn" id="save-settings-btn" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="gallery-picker-modal">
+    <div class="modal-panel wide-panel">
+      <div class="modal-head">
+        <h2>选择参考作品</h2>
+        <button class="close-btn" data-close="gallery-picker-modal" type="button">×</button>
+      </div>
+      <div class="picker-grid" id="gallery-picker-grid"></div>
+      <div class="modal-actions">
+        <button class="secondary-btn" data-close="gallery-picker-modal" type="button">取消</button>
+        <button class="primary-btn" id="use-picked-gallery-btn" type="button">加入参考</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="folder-picker-modal">
+    <div class="modal-panel">
+      <div class="modal-head">
+        <h2>归档到文件夹</h2>
+        <button class="close-btn" data-close="folder-picker-modal" type="button">×</button>
+      </div>
+      <div class="folder-picker-list" id="folder-picker-list"></div>
+      <div class="modal-actions">
+        <button class="secondary-btn" data-close="folder-picker-modal" type="button">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="folder-create-modal">
+    <div class="modal-panel">
+      <div class="modal-head">
+        <h2>新建作品文件夹</h2>
+        <button class="close-btn" data-close="folder-create-modal" type="button">×</button>
+      </div>
+      <label class="full-label">文件夹名称
+        <input id="folder-name-input" type="text" placeholder="例如：雨夜车站分镜">
+      </label>
+      <div class="modal-actions">
+        <button class="secondary-btn" data-close="folder-create-modal" type="button">取消</button>
+        <button class="primary-btn" id="confirm-create-folder-btn" type="button">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="storyboard-modal">
+    <div class="modal-panel storyboard-panel">
+      <div class="modal-head">
+        <h2>连续出图</h2>
+        <button class="close-btn" data-close="storyboard-modal" type="button">×</button>
+      </div>
+      <div class="storyboard-steps" id="storyboard-steps">
+        <span data-storyboard-step="plan" class="active">1 规划核心</span>
+        <span data-storyboard-step="refs">2 生成参考</span>
+        <span data-storyboard-step="frames">3 剧情出图</span>
+      </div>
+      <div class="storyboard-layout">
+        <section class="storyboard-form">
+          <label class="full-label compact-label">剧情
+            <textarea id="storyboard-story" rows="6" placeholder="输入一段剧情，例如：少女在雨夜收到一封旧信，沿着线索走进废弃车站，发现父亲留下的秘密。"></textarea>
+          </label>
+          <div class="option-row inset-options">
+            <button class="option-chip" data-insert-target="storyboard-story" data-insert="胖乎乎橘猫和乐天柴犬住在同一个公寓。午餐时，贴着笑脸的扫地机器人拖走香肠和披萨盒，猫像侦探一样指挥，狗一路追着午餐，客厅变成搞笑舞台，最后他们一起完成宠物才艺秀。" type="button">猫狗搞笑</button>
+            <button class="option-chip" data-insert-target="storyboard-story" data-insert="一名年轻调查员在雨夜收到旧信，沿着线索进入废弃车站，逐步发现家族秘密。" type="button">悬疑短片</button>
+            <button class="option-chip" data-insert-target="storyboard-story" data-insert="一个普通角色获得神秘物件，从日常空间出发，穿过陌生场景，最终完成一次自我改变。" type="button">角色旅程</button>
+            <button class="option-chip" data-insert-target="storyboard-story" data-insert="一件核心产品从设计草图、材料细节、使用场景到最终发布，形成完整视觉叙事。" type="button">产品故事</button>
+          </div>
+          <div class="storyboard-fields">
+            <label>张数
+              <input id="storyboard-count" type="number" min="1" max="24" value="6">
+              <span class="inline-options">
+                <button class="option-chip mini" data-insert-target="storyboard-count" data-insert="4" data-insert-mode="replace" type="button">4</button>
+                <button class="option-chip mini" data-insert-target="storyboard-count" data-insert="6" data-insert-mode="replace" type="button">6</button>
+                <button class="option-chip mini" data-insert-target="storyboard-count" data-insert="8" data-insert-mode="replace" type="button">8</button>
+                <button class="option-chip mini" data-insert-target="storyboard-count" data-insert="12" data-insert-mode="replace" type="button">12</button>
+              </span>
+            </label>
+            <label>视觉风格
+              <input id="storyboard-style" type="text" value="电影感，写实摄影，统一色调">
+              <span class="inline-options">
+                <button class="option-chip mini" data-insert-target="storyboard-style" data-insert="电影感，写实摄影，统一色调" data-insert-mode="replace" type="button">电影感</button>
+                <button class="option-chip mini" data-insert-target="storyboard-style" data-insert="日漫分镜，清透色彩，细腻人物表情" data-insert-mode="replace" type="button">日漫</button>
+                <button class="option-chip mini" data-insert-target="storyboard-style" data-insert="儿童绘本，温暖色彩，柔和笔触" data-insert-mode="replace" type="button">绘本</button>
+                <button class="option-chip mini" data-insert-target="storyboard-style" data-insert="商业广告，高级布光，干净背景" data-insert-mode="replace" type="button">广告</button>
+              </span>
+            </label>
+            <label>收纳文件夹
+              <input id="storyboard-folder-name" type="text" placeholder="自动使用剧情标题">
+            </label>
+          </div>
+          <label class="full-label compact-label">连续性要求
+            <textarea id="storyboard-continuity" rows="3" placeholder="例如：主角始终穿蓝色风衣；画面色调从冷蓝逐渐转为暖金；镜头跟随主角推进。"></textarea>
+          </label>
+          <div class="option-row inset-options">
+            <button class="option-chip" data-insert-target="storyboard-continuity" data-insert="主角外貌、发型、服装、年龄感和标志性配饰在所有画面中保持一致。" type="button">角色锁定</button>
+            <button class="option-chip" data-insert-target="storyboard-continuity" data-insert="核心道具的形状、材质、颜色和磨损细节贯穿所有相关画面。" type="button">道具贯穿</button>
+            <button class="option-chip" data-insert-target="storyboard-continuity" data-insert="画面色调随剧情从冷色逐渐转向暖色，但主体视觉特征保持不变。" type="button">色彩递进</button>
+          </div>
+          <div class="storyboard-actions">
+            <button class="secondary-btn" id="storyboard-reset-btn" type="button">重置</button>
+            <button class="primary-btn" id="storyboard-plan-btn" type="button">规划核心与剧情</button>
+          </div>
+          <div class="storyboard-left-section">
+            <div class="storyboard-section-head">
+              <span>核心参考图</span>
+              <button class="ghost-mini" id="storyboard-add-anchor-btn" type="button">添加</button>
+            </div>
+            <div class="anchor-template-row">
+              <button class="option-chip mini" data-anchor-template="character" type="button">角色</button>
+              <button class="option-chip mini" data-anchor-template="object" type="button">关键对象</button>
+              <button class="option-chip mini" data-anchor-template="location" type="button">地点</button>
+              <button class="option-chip mini" data-anchor-template="theme" type="button">核心主题</button>
+            </div>
+            <div class="anchor-list" id="storyboard-anchor-list"></div>
+          </div>
+        </section>
+        <section class="storyboard-preview">
+          <div class="storyboard-status" id="storyboard-status">先规划角色、关键对象和核心主题。</div>
+          <div class="storyboard-section-head">
+            <span>分镜画面</span>
+          </div>
+          <div class="frame-list" id="storyboard-frame-list"></div>
+        </section>
+      </div>
+      <div class="modal-actions">
+        <button class="secondary-btn" data-close="storyboard-modal" type="button">关闭</button>
+        <button class="secondary-btn" id="storyboard-reference-btn" type="button" disabled>生成核心参考图</button>
+        <button class="primary-btn" id="storyboard-start-btn" type="button" disabled>继续生成剧情图</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="edit-modal">
+    <div class="modal-panel edit-panel">
+      <div class="modal-head">
+        <h2>带图编辑</h2>
+        <button class="close-btn" data-close="edit-modal" type="button">×</button>
+      </div>
+      <div class="edit-preview-wrap">
+        <img id="edit-preview" alt="待编辑图片">
+      </div>
+      <label class="full-label">编辑目标
+        <textarea id="edit-prompt" rows="4" placeholder="例如：保持构图，把背景改成清晨海边，人物衣服改成蓝色风衣"></textarea>
+      </label>
+      <div class="option-row inset-options">
+        <button class="option-chip" data-insert-target="edit-prompt" data-insert="保持主体姿态、构图和镜头距离不变，只调整指定区域。" type="button">保持构图</button>
+        <button class="option-chip" data-insert-target="edit-prompt" data-insert="把背景改成清晨海边，保留人物外貌、服装和光影方向。" type="button">改背景</button>
+        <button class="option-chip" data-insert-target="edit-prompt" data-insert="提升材质细节、光影层次和画面清晰度，不改变主体身份。" type="button">提质感</button>
+      </div>
+      <div class="modal-actions">
+        <button class="secondary-btn" id="open-mark-from-edit-btn" type="button">打开标注</button>
+        <button class="primary-btn" id="confirm-edit-generate-btn" type="button">提交编辑</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="mark-modal">
+    <div class="modal-panel mark-panel">
+      <div class="modal-head">
+        <h2>标注参考图</h2>
+        <button class="close-btn" data-close="mark-modal" type="button">×</button>
+      </div>
+      <div class="mark-toolbar">
+        <button class="mark-tool active" data-tool="brush" type="button">画笔</button>
+        <button class="mark-tool" data-tool="line" type="button">直线</button>
+        <button class="mark-tool" data-tool="arrow" type="button">箭头</button>
+        <button class="mark-tool" data-tool="rect" type="button">矩形</button>
+        <button class="mark-tool" data-tool="circle" type="button">圆形</button>
+        <button class="mark-tool" data-tool="select" type="button">选择</button>
+        <input id="mark-color" type="color" value="#ef4444" title="颜色">
+        <input id="mark-size" type="range" min="2" max="40" value="8" title="粗细">
+        <button class="ghost-mini" id="mark-undo-btn" type="button">撤销</button>
+        <button class="ghost-mini" id="mark-clear-btn" type="button">清空</button>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="mark-canvas"></canvas>
+      </div>
+      <div class="modal-actions">
+        <button class="secondary-btn" data-close="mark-modal" type="button">取消</button>
+        <button class="primary-btn" id="save-mark-btn" type="button">保存标注</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="assets-modal">
+    <div class="modal-panel wide-panel">
+      <div class="modal-head">
+        <h2>一致性素材</h2>
+        <button class="close-btn" data-close="assets-modal" type="button">×</button>
+      </div>
+      <div class="asset-editor">
+        <div class="asset-form">
+          <label>类型
+            <select id="asset-type">
+              <option value="character">角色</option>
+              <option value="scene">场景</option>
+              <option value="prop">道具</option>
+            </select>
+          </label>
+          <label>名称
+            <input id="asset-name" type="text" placeholder="例如：阿岚">
+          </label>
+          <label class="full-label">描述
+            <textarea id="asset-desc" rows="4" placeholder="外貌、服装、性格、场景氛围或道具材质。"></textarea>
+          </label>
+          <div class="option-row inset-options">
+            <button class="option-chip" data-insert-target="asset-desc" data-insert="外貌年龄感、发型、脸型、服装颜色、标志性配饰、整体气质。" type="button">角色模板</button>
+            <button class="option-chip" data-insert-target="asset-desc" data-insert="空间结构、时间天气、主色调、光线方向、关键陈设、氛围关键词。" type="button">场景模板</button>
+            <button class="option-chip" data-insert-target="asset-desc" data-insert="形状比例、材质、颜色、纹理、磨损痕迹、标志性细节。" type="button">道具模板</button>
+          </div>
+          <button class="primary-btn" id="save-asset-btn" type="button">保存资产卡</button>
+        </div>
+        <div class="asset-list" id="asset-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
