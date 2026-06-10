@@ -10,6 +10,8 @@ This phase adds the storage foundation for a future multi-user PicSet system whi
 - `audit_logs`: append-only operation log for record writes and deletes.
 - `generation_tasks`: future persistent generation queue/task state.
 - `email_verifications`: short-lived email verification codes for registration and login.
+- `user_quotas`: per-user generation quota and usage counters.
+- `usage_events`: append-only generation usage ledger.
 - `records`: existing JSON store, extended with `owner_id` and `deleted_at`.
 
 ## Bootstrap
@@ -21,6 +23,7 @@ On server startup:
 3. A default owner user is created with id `user_system_admin`.
 4. Existing records are migrated to `user_system_admin` unless they already carry `ownerId`.
 5. Existing projects receive an owner membership row in `project_members`.
+6. Every user gets a `user_quotas` row; the default system owner is unlimited, and new registrations start with 10 free image generations.
 
 Optional admin seed environment variables:
 
@@ -32,6 +35,12 @@ PICSET_ADMIN_PASSWORD=
 ```
 
 If `PICSET_ADMIN_PASSWORD` is empty, the default owner account is created with `setup_required` status. The first real email-verified registration becomes an `owner` and receives owner membership on existing projects, so existing migrated data remains accessible after auth is enabled.
+
+You can also override the initial free quota:
+
+```env
+PICSET_FREE_GENERATIONS=10
+```
 
 ## Email Auth
 
@@ -66,6 +75,12 @@ Auth API:
 - `POST /api/auth/login/verify`: verify login code, create session.
 - `POST /api/auth/logout`: revoke session and clear cookie.
 
+Quota and admin API:
+
+- `GET /api/admin/users`: list users with quota and record summaries.
+- `GET /api/admin/users/:id/overview`: return one user's quota, records, and recent usage events.
+- `POST /api/admin/users/:id/quota`: update a user's total or used generation count.
+
 ## Compatibility
 
 The frontend can keep using the existing `/api/data/*` endpoints. Server writes now attach:
@@ -86,6 +101,7 @@ Deletes are soft deletes through `deleted_at`, so list/bootstrap reads only retu
 - projects and project members
 - active/deleted records by store
 - generation tasks by status
+- quota rows and usage events
 - audit log totals
 
 This endpoint is a storage diagnostic surface and is protected by owner/admin auth.

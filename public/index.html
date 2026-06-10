@@ -113,6 +113,8 @@
           <div class="model-menu hidden" id="model-menu"></div>
         </div>
         <div class="api-status" id="api-status">配置检查中</div>
+        <div class="quota-chip hidden" id="quota-chip">剩余额度 --</div>
+        <button class="toolbar-btn hidden" id="open-admin-btn" type="button">用户管理</button>
         <button class="toolbar-btn" id="open-settings-btn" type="button" title="偏好设置">偏好</button>
         <div class="account-chip" id="account-chip">
           <span id="account-name">未登录</span>
@@ -199,6 +201,57 @@
         </div>
       </footer>
     </main>
+  </div>
+
+  <div class="modal-backdrop hidden" id="admin-modal">
+    <div class="modal-panel admin-panel wide-panel">
+      <div class="modal-head">
+        <h2>用户与数据管理</h2>
+        <button class="close-btn" data-close="admin-modal" type="button">×</button>
+      </div>
+      <div class="admin-summary" id="admin-summary"></div>
+      <div class="admin-layout">
+        <section class="admin-users-pane">
+          <div class="admin-pane-head">
+            <div>
+              <strong>用户</strong>
+              <span id="admin-user-count">--</span>
+            </div>
+            <button class="ghost-mini" id="refresh-admin-btn" type="button">刷新</button>
+          </div>
+          <div class="admin-user-list" id="admin-user-list"></div>
+        </section>
+        <section class="admin-detail-pane">
+          <div class="admin-empty" id="admin-detail-empty">选择用户查看使用次数、作品和生成记录。</div>
+          <div class="admin-detail hidden" id="admin-detail-content">
+            <div class="admin-detail-head">
+              <div>
+                <strong id="admin-detail-name">--</strong>
+                <span id="admin-detail-email">--</span>
+              </div>
+              <span id="admin-detail-role">--</span>
+            </div>
+            <div class="quota-form">
+              <label>总次数
+                <input id="admin-quota-total" type="number" min="-1" max="100000" step="1">
+              </label>
+              <label>已用次数
+                <input id="admin-quota-used" type="number" min="0" max="100000" step="1">
+              </label>
+              <button class="secondary-btn" id="admin-reset-used-btn" type="button">重置已用</button>
+              <button class="primary-btn" id="admin-save-quota-btn" type="button">保存次数</button>
+            </div>
+            <div class="modal-note">总次数填 -1 表示不限量；已用次数只影响额度计算，历史生成记录会继续保留。</div>
+            <div class="admin-record-grid" id="admin-record-grid"></div>
+            <div class="admin-section-title">最近生成事件</div>
+            <div class="admin-usage-list" id="admin-usage-list"></div>
+          </div>
+        </section>
+      </div>
+      <div class="modal-actions">
+        <button class="secondary-btn" data-close="admin-modal" type="button">关闭</button>
+      </div>
+    </div>
   </div>
 
   <div class="modal-backdrop hidden" id="settings-modal">

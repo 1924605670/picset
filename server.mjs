@@ -28,6 +28,8 @@ const VERIFICATION_RESEND_COOLDOWN_MS = 60 * 1000;
 const VERIFICATION_MAX_ATTEMPTS = 5;
 const VERIFICATION_EMAIL_HOURLY_LIMIT = 5;
 const VERIFICATION_IP_HOURLY_LIMIT = 20;
+const DEFAULT_FREE_GENERATION_CREDITS = 10;
+const UNLIMITED_QUOTA = -1;
 const DEFAULT_BASE_PATH = "/picset";
 const DATA_STORES = new Set(["projects", "conversations", "messages", "gallery", "galleryFolders", "favorites", "assets"]);
 const IMAGE_MODEL_OPTIONS = [
@@ -253,6 +255,32 @@ function initializeStorage() {
       consumed_at INTEGER
     );
 
+    CREATE TABLE IF NOT EXISTS user_quotas (
+      user_id TEXT PRIMARY KEY,
+      quota_total INTEGER NOT NULL DEFAULT 10,
+      quota_used INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      updated_by TEXT,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS usage_events (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      project_id TEXT,
+      message_id TEXT,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL,
+      cost INTEGER NOT NULL DEFAULT 1,
+      input_json TEXT NOT NULL DEFAULT '{}',
+      output_json TEXT NOT NULL DEFAULT '{}',
+      error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, expires_at);
     CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id);
     CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id);
@@ -260,6 +288,8 @@ function initializeStorage() {
     CREATE INDEX IF NOT EXISTS idx_generation_tasks_project ON generation_tasks(project_id, status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_email_verifications_email ON email_verifications(email, purpose, created_at);
     CREATE INDEX IF NOT EXISTS idx_email_verifications_ip ON email_verifications(ip, sent_at);
+    CREATE INDEX IF NOT EXISTS idx_usage_events_user ON usage_events(user_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_usage_events_status ON usage_events(status, created_at);
   `);
 
   addColumnIfMissing("records", "owner_id", "TEXT");
@@ -270,6 +300,7 @@ function initializeStorage() {
     CREATE INDEX IF NOT EXISTS idx_records_updated ON records(store, updated_at);
   `);
   seedDefaultAdmin();
+  ensureQuotasForExistingUsers();
   migrateRecordOwnership();
   ensureDefaultProject();
 }
@@ -324,6 +355,7 @@ function publicUser(user) {
     role: user.role,
     status: user.status,
     displayName: user.displayName || user.display_name || user.username,
+    quota: quotaSummaryForUser(user),
   };
 }
 
@@ -354,6 +386,150 @@ function activeHumanUserCount() {
     FROM users
     WHERE status = 'active' AND id != ?
   `).get(DEFAULT_ADMIN_USER_ID)?.count || 0);
+}
+
+function defaultFreeGenerationCredits() {
+  const raw = Number(pick(loadConfig(), ["PICSET_FREE_GENERATIONS", "PICSET_FREE_CREDITS"], String(DEFAULT_FREE_GENERATION_CREDITS)));
+  if (!Number.isFinite(raw)) return DEFAULT_FREE_GENERATION_CREDITS;
+  return Math.max(0, Math.floor(raw));
+}
+
+function defaultQuotaTotalForUser(user) {
+  if (user?.id === DEFAULT_ADMIN_USER_ID) return UNLIMITED_QUOTA;
+  return defaultFreeGenerationCredits();
+}
+
+function quotaRowForUser(userId) {
+  if (!userId) return null;
+  return db.prepare(`
+    SELECT
+      user_id AS userId,
+      quota_total AS quotaTotal,
+      quota_used AS quotaUsed,
+      created_at AS createdAt,
+      updated_at AS updatedAt,
+      updated_by AS updatedBy
+    FROM user_quotas
+    WHERE user_id = ?
+  `).get(userId) || null;
+}
+
+function ensureQuotaForUser(userOrId) {
+  const user = typeof userOrId === "string"
+    ? db.prepare("SELECT id, role FROM users WHERE id = ?").get(userOrId)
+    : userOrId;
+  if (!user?.id) return null;
+  const existing = quotaRowForUser(user.id);
+  if (existing) return existing;
+  const ts = nowMs();
+  db.prepare(`
+    INSERT INTO user_quotas (user_id, quota_total, quota_used, created_at, updated_at, updated_by)
+    VALUES (?, ?, 0, ?, ?, ?)
+  `).run(user.id, defaultQuotaTotalForUser(user), ts, ts, DEFAULT_ADMIN_USER_ID);
+  return quotaRowForUser(user.id);
+}
+
+function ensureQuotasForExistingUsers() {
+  const users = db.prepare("SELECT id, role FROM users").all();
+  for (const user of users) ensureQuotaForUser(user);
+}
+
+function quotaSummaryForUser(userOrId) {
+  const userId = typeof userOrId === "string" ? userOrId : userOrId?.id;
+  if (!userId) return null;
+  const row = ensureQuotaForUser(userOrId);
+  if (!row) return null;
+  const total = Number(row.quotaTotal ?? 0);
+  const used = Math.max(0, Number(row.quotaUsed || 0));
+  const unlimited = total < 0;
+  return {
+    total,
+    used,
+    remaining: unlimited ? null : Math.max(0, total - used),
+    unlimited,
+  };
+}
+
+function reserveGenerationCredit(user, input = {}) {
+  const actor = actorOrDefault(user);
+  ensureQuotaForUser(actor);
+  const before = quotaRowForUser(actor.id);
+  if (!before) throw new HttpError(500, "用户额度初始化失败", "quota_missing");
+  if (Number(before.quotaTotal) >= 0 && Number(before.quotaUsed) >= Number(before.quotaTotal)) {
+    throw new HttpError(402, "免费生成次数已用完，请联系管理员增加次数", "quota_exceeded");
+  }
+  const ts = nowMs();
+  const updated = db.prepare(`
+    UPDATE user_quotas
+    SET quota_used = quota_used + 1,
+      updated_at = ?
+    WHERE user_id = ?
+      AND (quota_total < 0 OR quota_used < quota_total)
+  `).run(ts, actor.id);
+  if (!updated?.changes) {
+    throw new HttpError(402, "免费生成次数已用完，请联系管理员增加次数", "quota_exceeded");
+  }
+  const eventId = storageId("usage");
+  const inputJson = JSON.stringify({
+    prompt: String(input.prompt || "").slice(0, 3000),
+    imageCount: Array.isArray(input.images) ? input.images.length : 0,
+    size: input.size || "auto",
+    quality: input.quality || "high",
+    format: input.format || "png",
+    seed: input.seed || 0,
+  });
+  db.prepare(`
+    INSERT INTO usage_events (id, user_id, project_id, message_id, kind, status, cost, input_json, output_json, error, created_at, updated_at)
+    VALUES (?, ?, ?, ?, 'image_generation', 'reserved', 1, ?, '{}', NULL, ?, ?)
+  `).run(
+    eventId,
+    actor.id,
+    String(input.projectId || ""),
+    String(input.messageId || ""),
+    inputJson,
+    ts,
+    ts,
+  );
+  return {
+    id: eventId,
+    userId: actor.id,
+    settled: false,
+    quota: quotaSummaryForUser(actor),
+  };
+}
+
+function refundGenerationCredit(reservation, error = "") {
+  if (!reservation || reservation.settled) return quotaSummaryForUser(reservation?.userId || "");
+  reservation.settled = true;
+  const ts = nowMs();
+  db.prepare(`
+    UPDATE user_quotas
+    SET quota_used = CASE WHEN quota_used > 0 THEN quota_used - 1 ELSE 0 END,
+      updated_at = ?
+    WHERE user_id = ?
+  `).run(ts, reservation.userId);
+  db.prepare(`
+    UPDATE usage_events
+    SET status = 'refunded',
+      error = ?,
+      updated_at = ?
+    WHERE id = ? AND status = 'reserved'
+  `).run(String(error || "").slice(0, 1200), ts, reservation.id);
+  return quotaSummaryForUser(reservation.userId);
+}
+
+function commitGenerationCredit(reservation, output = {}) {
+  if (!reservation || reservation.settled) return quotaSummaryForUser(reservation?.userId || "");
+  reservation.settled = true;
+  const ts = nowMs();
+  db.prepare(`
+    UPDATE usage_events
+    SET status = 'succeeded',
+      output_json = ?,
+      updated_at = ?
+    WHERE id = ? AND status = 'reserved'
+  `).run(JSON.stringify(output || {}), ts, reservation.id);
+  return quotaSummaryForUser(reservation.userId);
 }
 
 function getActiveRecordRow(store, id) {
@@ -537,8 +713,8 @@ function scalarCount(sql, params = []) {
   return Number(db.prepare(sql).get(...params)?.count || 0);
 }
 
-function groupedCounts(sql) {
-  return db.prepare(sql).all().map((row) => {
+function groupedCounts(sql, params = []) {
+  return db.prepare(sql).all(...params).map((row) => {
     const next = {};
     for (const [key, value] of Object.entries(row)) {
       next[key] = typeof value === "number" ? value : value ?? "";
@@ -580,6 +756,17 @@ function storageOverview() {
       total: scalarCount("SELECT COUNT(*) AS count FROM generation_tasks"),
       byStatus: groupedCounts("SELECT status, COUNT(*) AS count FROM generation_tasks GROUP BY status ORDER BY status"),
     },
+    quotas: {
+      total: scalarCount("SELECT COUNT(*) AS count FROM user_quotas"),
+      limited: scalarCount("SELECT COUNT(*) AS count FROM user_quotas WHERE quota_total >= 0"),
+      unlimited: scalarCount("SELECT COUNT(*) AS count FROM user_quotas WHERE quota_total < 0"),
+      used: scalarCount("SELECT SUM(quota_used) AS count FROM user_quotas"),
+    },
+    usageEvents: {
+      total: scalarCount("SELECT COUNT(*) AS count FROM usage_events"),
+      byStatus: groupedCounts("SELECT status, COUNT(*) AS count FROM usage_events GROUP BY status ORDER BY status"),
+      succeeded: scalarCount("SELECT COUNT(*) AS count FROM usage_events WHERE status = 'succeeded'"),
+    },
     emailVerifications: {
       total: scalarCount("SELECT COUNT(*) AS count FROM email_verifications"),
       active: scalarCount("SELECT COUNT(*) AS count FROM email_verifications WHERE consumed_at IS NULL AND expires_at > ?", [nowMs()]),
@@ -589,6 +776,204 @@ function storageOverview() {
       latestAt: Number(db.prepare("SELECT MAX(created_at) AS latestAt FROM audit_logs").get()?.latestAt || 0),
     },
   };
+}
+
+function userRecordCounts(userId) {
+  const counts = {};
+  for (const row of groupedCounts(`
+    SELECT store, COUNT(*) AS count
+    FROM records
+    WHERE owner_id = ? AND deleted_at = 0
+    GROUP BY store
+    ORDER BY store
+  `, [userId])) {
+    counts[row.store] = Number(row.count || 0);
+  }
+  return counts;
+}
+
+function adminUserRowById(userId) {
+  return db.prepare(`
+    SELECT
+      id,
+      username,
+      email,
+      role,
+      status,
+      display_name AS displayName,
+      created_at AS createdAt,
+      updated_at AS updatedAt,
+      last_login_at AS lastLoginAt
+    FROM users
+    WHERE id = ?
+  `).get(userId) || null;
+}
+
+function adminUserSummary(user) {
+  ensureQuotaForUser(user);
+  const records = userRecordCounts(user.id);
+  const latestRecordAt = Number(db.prepare(`
+    SELECT MAX(updated_at) AS latestAt
+    FROM records
+    WHERE owner_id = ? AND deleted_at = 0
+  `).get(user.id)?.latestAt || 0);
+  const latestUsageAt = Number(db.prepare(`
+    SELECT MAX(created_at) AS latestAt
+    FROM usage_events
+    WHERE user_id = ?
+  `).get(user.id)?.latestAt || 0);
+  return {
+    id: user.id,
+    username: user.username,
+    email: user.email,
+    role: user.role,
+    status: user.status,
+    displayName: user.displayName || user.username,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+    lastLoginAt: user.lastLoginAt || 0,
+    quota: quotaSummaryForUser(user),
+    usage: {
+      total: scalarCount("SELECT COUNT(*) AS count FROM usage_events WHERE user_id = ?", [user.id]),
+      succeeded: scalarCount("SELECT COUNT(*) AS count FROM usage_events WHERE user_id = ? AND status = 'succeeded'", [user.id]),
+      refunded: scalarCount("SELECT COUNT(*) AS count FROM usage_events WHERE user_id = ? AND status = 'refunded'", [user.id]),
+      latestAt: Math.max(latestUsageAt, latestRecordAt),
+    },
+    records,
+    recordTotal: Object.values(records).reduce((sum, count) => sum + Number(count || 0), 0),
+  };
+}
+
+function adminUsersOverview() {
+  const users = db.prepare(`
+    SELECT
+      id,
+      username,
+      email,
+      role,
+      status,
+      display_name AS displayName,
+      created_at AS createdAt,
+      updated_at AS updatedAt,
+      last_login_at AS lastLoginAt
+    FROM users
+    ORDER BY created_at DESC
+  `).all();
+  ensureQuotasForExistingUsers();
+  return {
+    overview: {
+      users: {
+        total: users.length,
+        active: users.filter((user) => user.status === "active").length,
+        admin: users.filter((user) => user.role === "owner" || user.role === "admin").length,
+      },
+      usage: {
+        succeeded: scalarCount("SELECT COUNT(*) AS count FROM usage_events WHERE status = 'succeeded'"),
+        reserved: scalarCount("SELECT COUNT(*) AS count FROM usage_events WHERE status = 'reserved'"),
+        refunded: scalarCount("SELECT COUNT(*) AS count FROM usage_events WHERE status = 'refunded'"),
+      },
+      records: {
+        total: scalarCount("SELECT COUNT(*) AS count FROM records WHERE deleted_at = 0"),
+        gallery: scalarCount("SELECT COUNT(*) AS count FROM records WHERE store = 'gallery' AND deleted_at = 0"),
+        messages: scalarCount("SELECT COUNT(*) AS count FROM records WHERE store = 'messages' AND deleted_at = 0"),
+      },
+    },
+    users: users.map(adminUserSummary),
+  };
+}
+
+function adminUserDetail(userId) {
+  const user = adminUserRowById(userId);
+  if (!user) throw new HttpError(404, "用户不存在", "user_not_found");
+  const summary = adminUserSummary(user);
+  const recordBreakdown = groupedCounts(`
+    SELECT store,
+      COUNT(*) AS count,
+      MAX(updated_at) AS latestAt
+    FROM records
+    WHERE owner_id = ? AND deleted_at = 0
+    GROUP BY store
+    ORDER BY store
+  `, [user.id]);
+  const recentUsage = db.prepare(`
+    SELECT
+      id,
+      project_id AS projectId,
+      message_id AS messageId,
+      kind,
+      status,
+      cost,
+      input_json AS inputJson,
+      output_json AS outputJson,
+      error,
+      created_at AS createdAt,
+      updated_at AS updatedAt
+    FROM usage_events
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+    LIMIT 20
+  `).all(user.id).map((event) => {
+    let input = {};
+    let output = {};
+    try { input = JSON.parse(event.inputJson || "{}"); } catch {}
+    try { output = JSON.parse(event.outputJson || "{}"); } catch {}
+    return {
+      id: event.id,
+      projectId: event.projectId || "",
+      messageId: event.messageId || "",
+      kind: event.kind,
+      status: event.status,
+      cost: Number(event.cost || 0),
+      input,
+      output,
+      error: event.error || "",
+      createdAt: event.createdAt,
+      updatedAt: event.updatedAt,
+    };
+  });
+  return { ...summary, recordBreakdown, recentUsage };
+}
+
+function normalizeQuotaTotal(value) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw)) throw new HttpError(400, "请输入有效的总次数", "invalid_quota_total");
+  const total = Math.floor(raw);
+  if (total < UNLIMITED_QUOTA || total > 100000) throw new HttpError(400, "总次数范围应为 -1 到 100000", "invalid_quota_total");
+  return total;
+}
+
+function normalizeQuotaUsed(value) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw)) throw new HttpError(400, "请输入有效的已用次数", "invalid_quota_used");
+  const used = Math.floor(raw);
+  if (used < 0 || used > 100000) throw new HttpError(400, "已用次数范围应为 0 到 100000", "invalid_quota_used");
+  return used;
+}
+
+function updateUserQuota(targetUserId, input = {}, actor = null) {
+  const user = adminUserRowById(targetUserId);
+  if (!user) throw new HttpError(404, "用户不存在", "user_not_found");
+  const quota = ensureQuotaForUser(user);
+  const nextTotal = Object.prototype.hasOwnProperty.call(input, "quotaTotal")
+    ? normalizeQuotaTotal(input.quotaTotal)
+    : Number(quota.quotaTotal);
+  const nextUsed = Object.prototype.hasOwnProperty.call(input, "quotaUsed")
+    ? normalizeQuotaUsed(input.quotaUsed)
+    : Number(quota.quotaUsed || 0);
+  const ts = nowMs();
+  db.prepare(`
+    UPDATE user_quotas
+    SET quota_total = ?,
+      quota_used = ?,
+      updated_at = ?,
+      updated_by = ?
+    WHERE user_id = ?
+  `).run(nextTotal, nextUsed, ts, actor?.id || DEFAULT_ADMIN_USER_ID, targetUserId);
+  writeAuditLog("quota.updated", "user", targetUserId, "", {
+    quotaTotal: nextTotal,
+    quotaUsed: nextUsed,
+  }, actor?.id || DEFAULT_ADMIN_USER_ID);
+  return adminUserDetail(targetUserId);
 }
 
 function parseEnvFile(path) {
@@ -953,6 +1338,7 @@ function createUserFromRegistration(email, input = {}) {
     INSERT INTO users (id, username, email, password_hash, role, status, display_name, created_at, updated_at, last_login_at)
     VALUES (?, ?, ?, NULL, ?, 'active', ?, ?, ?, NULL)
   `).run(user.id, user.username, user.email, user.role, user.displayName, ts, ts);
+  ensureQuotaForUser(user);
   writeAuditLog("user.registered", "user", user.id, "", { email, role }, user.id);
   if (firstHuman) {
     const projects = db.prepare("SELECT id FROM records WHERE store = 'projects' AND deleted_at = 0").all();
@@ -1241,13 +1627,15 @@ function parseSseEvent(raw) {
   }
 }
 
-async function proxyGenerate(req, res) {
+async function proxyGenerate(req, res, user) {
   const input = await readJson(req);
   const { cfg, payload, format } = buildImagePayload(input);
   if (!cfg.apiKey) {
     sendJson(res, 400, { error: "missing API key in env" });
     return;
   }
+  const reservation = reserveGenerationCredit(user, input);
+  let keepaliveTimer = null;
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -1265,6 +1653,7 @@ async function proxyGenerate(req, res) {
     size: payload.tools[0].size || "auto",
     quality: payload.tools[0].quality,
     format,
+    quota: reservation.quota,
   });
 
   try {
@@ -1286,6 +1675,7 @@ async function proxyGenerate(req, res) {
         const json = JSON.parse(raw);
         message = json?.error?.message || json?.message || JSON.stringify(json).slice(0, 1200);
       } catch {}
+      refundGenerationCredit(reservation, message || `HTTP ${upstream.status}`);
       sseSend(res, "error", { status: upstream.status, message });
       res.end();
       return;
@@ -1296,9 +1686,12 @@ async function proxyGenerate(req, res) {
       const data = await upstream.json();
       const image = extractImage(data);
       if (!image) {
+        refundGenerationCredit(reservation, "API 返回成功，但没有找到图片数据");
         sseSend(res, "error", { message: "API 返回成功，但没有找到图片数据" });
       } else {
-        sseSend(res, "result", { image, usage: extractUsage(data), elapsedMs: Date.now() - startedAt, format });
+        const usage = extractUsage(data);
+        const quota = commitGenerationCredit(reservation, { usage, elapsedMs: Date.now() - startedAt, format });
+        sseSend(res, "result", { image, usage, elapsedMs: Date.now() - startedAt, format, quota });
       }
       res.end();
       return;
@@ -1311,7 +1704,7 @@ async function proxyGenerate(req, res) {
     let finalResponse = null;
     let failedMessage = "";
     let eventCount = 0;
-    let keepaliveTimer = setInterval(() => {
+    keepaliveTimer = setInterval(() => {
       sseSend(res, "log", { label: "连接保持中", type: "keepalive", elapsedMs: Date.now() - startedAt });
     }, 25000);
 
@@ -1356,8 +1749,10 @@ async function proxyGenerate(req, res) {
     }
     if (buffer.trim()) flush(buffer);
     clearInterval(keepaliveTimer);
+    keepaliveTimer = null;
 
     if (failedMessage) {
+      refundGenerationCredit(reservation, failedMessage);
       res.end();
       return;
     }
@@ -1366,12 +1761,16 @@ async function proxyGenerate(req, res) {
       latestUsage = latestUsage || extractUsage(finalResponse);
     }
     if (!latestImage) {
+      refundGenerationCredit(reservation, "流结束，但未能提取图片数据");
       sseSend(res, "error", { message: "流结束，但未能提取图片数据" });
     } else {
-      sseSend(res, "result", { image: latestImage, usage: latestUsage, elapsedMs: Date.now() - startedAt, format });
+      const quota = commitGenerationCredit(reservation, { usage: latestUsage, elapsedMs: Date.now() - startedAt, format });
+      sseSend(res, "result", { image: latestImage, usage: latestUsage, elapsedMs: Date.now() - startedAt, format, quota });
     }
     res.end();
   } catch (error) {
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
+    refundGenerationCredit(reservation, error?.message || String(error));
     if (error?.name === "AbortError") return;
     sseSend(res, "error", { message: error?.message || String(error) });
     res.end();
@@ -1683,9 +2082,31 @@ async function route(req, res) {
       sendJson(res, 200, storageOverview());
       return;
     }
+    if (req.method === "GET" && requestPath === "/api/admin/users") {
+      const user = requireCurrentUser(req);
+      if (!isGlobalAdmin(user)) throw new HttpError(403, "需要管理员权限", "admin_required");
+      sendJson(res, 200, adminUsersOverview());
+      return;
+    }
+    const adminUserMatch = requestPath.match(/^\/api\/admin\/users\/([^/]+)(?:\/([^/]+))?$/);
+    if (adminUserMatch) {
+      const user = requireCurrentUser(req);
+      if (!isGlobalAdmin(user)) throw new HttpError(403, "需要管理员权限", "admin_required");
+      const targetUserId = decodeURIComponent(adminUserMatch[1]);
+      const action = adminUserMatch[2] ? decodeURIComponent(adminUserMatch[2]) : "";
+      if (req.method === "GET" && action === "overview") {
+        sendJson(res, 200, { user: adminUserDetail(targetUserId) });
+        return;
+      }
+      if (req.method === "POST" && action === "quota") {
+        const input = await readJson(req);
+        sendJson(res, 200, { user: updateUserQuota(targetUserId, input, user) });
+        return;
+      }
+    }
     if (req.method === "POST" && requestPath === "/api/generate") {
-      requireCurrentUser(req);
-      await proxyGenerate(req, res);
+      const user = requireCurrentUser(req);
+      await proxyGenerate(req, res, user);
       return;
     }
     if (req.method === "POST" && requestPath === "/api/enhance") {

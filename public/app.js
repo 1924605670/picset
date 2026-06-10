@@ -26,6 +26,13 @@ const state = {
     timeoutMs: 0,
     retries: 1,
   },
+  admin: {
+    users: [],
+    overview: null,
+    selectedUserId: "",
+    selectedUser: null,
+    busy: false,
+  },
   projects: [],
   currentProjectId: localStorage.getItem("picsetCurrentProjectId") || DEFAULT_PROJECT_ID,
   conversations: [],
@@ -121,11 +128,28 @@ function showAuthenticatedApp(show) {
   $("#app-shell")?.classList.toggle("hidden", !show);
 }
 
+function isGlobalAdminUser(user = state.auth.user) {
+  return user?.role === "owner" || user?.role === "admin";
+}
+
+function quotaDisplay(quota) {
+  if (!quota) return "额度 --";
+  if (quota.unlimited || Number(quota.total) < 0) return `已用 ${Number(quota.used || 0)} · 不限量`;
+  return `剩余 ${Number(quota.remaining || 0)}/${Number(quota.total || 0)}`;
+}
+
 function renderAccount() {
   const user = state.auth.user;
   const name = user?.displayName || user?.username || user?.email || "未登录";
   const el = $("#account-name");
   if (el) el.textContent = name;
+  const quota = $("#quota-chip");
+  if (quota) {
+    quota.textContent = quotaDisplay(user?.quota);
+    quota.classList.toggle("hidden", !user);
+    quota.classList.toggle("empty", Boolean(user?.quota && !user.quota.unlimited && Number(user.quota.remaining || 0) <= 0));
+  }
+  $("#open-admin-btn")?.classList.toggle("hidden", !isGlobalAdminUser(user));
 }
 
 function authEmail() {
@@ -275,6 +299,7 @@ function resetWorkspaceState() {
   state.currentProjectId = DEFAULT_PROJECT_ID;
   state.currentConversationId = null;
   state.activeGalleryFolderId = "all";
+  state.admin = { users: [], overview: null, selectedUserId: "", selectedUser: null, busy: false };
   localStorage.removeItem("picsetCurrentProjectId");
   resetStoryboardStateOnly();
 }
@@ -320,6 +345,7 @@ async function initAuth() {
       return true;
     }
     showAuthenticatedApp(false);
+    renderAccount();
     setAuthMode("login");
     const hint = data.resendConfigured || data.devAuthCode
       ? "输入邮箱接收验证码后进入工作区。"
@@ -1189,6 +1215,8 @@ async function runGeneration(msgId) {
         seed: msg.seed || 0,
         model: STANDARD_IMAGE_MODEL,
         apiBase: state.settings.apiBase || undefined,
+        projectId: msg.projectId || state.currentProjectId,
+        messageId: msg.id,
       }, controller.signal, (event, data) => {
         if (event === "log") {
           appendLog(msg, data.label || data.type || "日志");
@@ -1208,6 +1236,10 @@ async function runGeneration(msgId) {
       msg.image = image;
       msg.elapsedMs = result.elapsedMs;
       msg.usage = result.usage || null;
+      if (result.quota && state.auth.user) {
+        state.auth.user.quota = result.quota;
+        renderAccount();
+      }
       msg.bytes = estimateDataUrlBytes(image);
       msg.retryAttempt = 0;
       appendLog(msg, "生成完成");
@@ -1527,6 +1559,206 @@ function usePickedGallery() {
     if (item) addPendingImage(item.image);
   }
   closeModal("gallery-picker-modal");
+}
+
+function roleLabel(role) {
+  return {
+    owner: "所有者",
+    admin: "管理员",
+    member: "成员",
+    viewer: "访客",
+  }[role] || role || "--";
+}
+
+function statusLabel(status) {
+  return {
+    active: "正常",
+    disabled: "停用",
+    setup_required: "待配置",
+  }[status] || status || "--";
+}
+
+function fullTime(ts) {
+  if (!ts) return "--";
+  return new Date(ts).toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+async function loadAdminUsers(selectUserId = state.admin.selectedUserId) {
+  state.admin.busy = true;
+  renderAdminSummary();
+  try {
+    const res = await fetch("api/admin/users");
+    const data = await readApiJson(res, "读取用户管理数据失败");
+    state.admin.users = data.users || [];
+    state.admin.overview = data.overview || null;
+    state.admin.selectedUserId = selectUserId || state.admin.users[0]?.id || "";
+    renderAdminSummary();
+    renderAdminUserList();
+    if (state.admin.selectedUserId) await loadAdminUserDetail(state.admin.selectedUserId);
+  } catch (error) {
+    toast(error.message || "读取用户管理数据失败");
+  } finally {
+    state.admin.busy = false;
+    renderAdminSummary();
+  }
+}
+
+function renderAdminSummary() {
+  const wrap = $("#admin-summary");
+  if (!wrap) return;
+  const overview = state.admin.overview;
+  if (state.admin.busy && !overview) {
+    wrap.innerHTML = `<div class="admin-stat"><strong>加载中</strong><span>正在读取用户和数据总览</span></div>`;
+    return;
+  }
+  const stats = [
+    { label: "用户总数", value: overview?.users?.total ?? "--", sub: `${overview?.users?.active ?? "--"} 个正常账号` },
+    { label: "管理员", value: overview?.users?.admin ?? "--", sub: "owner / admin" },
+    { label: "成功生成", value: overview?.usage?.succeeded ?? "--", sub: `${overview?.usage?.refunded ?? "--"} 次失败返还` },
+    { label: "作品数据", value: overview?.records?.gallery ?? "--", sub: `${overview?.records?.messages ?? "--"} 条消息记录` },
+  ];
+  wrap.innerHTML = stats.map((stat) => `
+    <div class="admin-stat">
+      <span>${escapeHtml(stat.label)}</span>
+      <strong>${escapeHtml(stat.value)}</strong>
+      <em>${escapeHtml(stat.sub)}</em>
+    </div>
+  `).join("");
+}
+
+function renderAdminUserList() {
+  const list = $("#admin-user-list");
+  if (!list) return;
+  $("#admin-user-count").textContent = `${state.admin.users.length} 个`;
+  list.innerHTML = "";
+  for (const user of state.admin.users) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `admin-user-row ${user.id === state.admin.selectedUserId ? "active" : ""}`;
+    btn.innerHTML = `
+      <div>
+        <strong>${escapeHtml(user.displayName || user.username || user.email)}</strong>
+        <span>${escapeHtml(user.email)} · ${escapeHtml(roleLabel(user.role))}</span>
+      </div>
+      <em>${escapeHtml(quotaDisplay(user.quota))}</em>
+    `;
+    btn.onclick = () => loadAdminUserDetail(user.id);
+    list.appendChild(btn);
+  }
+}
+
+async function loadAdminUserDetail(userId) {
+  if (!userId) return;
+  state.admin.selectedUserId = userId;
+  renderAdminUserList();
+  $("#admin-detail-empty")?.classList.add("hidden");
+  $("#admin-detail-content")?.classList.remove("hidden");
+  $("#admin-detail-name").textContent = "加载中";
+  $("#admin-detail-email").textContent = "";
+  try {
+    const res = await fetch(`api/admin/users/${encodeURIComponent(userId)}/overview`);
+    const data = await readApiJson(res, "读取用户详情失败");
+    state.admin.selectedUser = data.user || null;
+    renderAdminDetail();
+  } catch (error) {
+    toast(error.message || "读取用户详情失败");
+  }
+}
+
+function renderAdminDetail() {
+  const user = state.admin.selectedUser;
+  if (!user) {
+    $("#admin-detail-empty")?.classList.remove("hidden");
+    $("#admin-detail-content")?.classList.add("hidden");
+    return;
+  }
+  $("#admin-detail-empty")?.classList.add("hidden");
+  $("#admin-detail-content")?.classList.remove("hidden");
+  $("#admin-detail-name").textContent = user.displayName || user.username || user.email;
+  $("#admin-detail-email").textContent = `${user.email} · ${statusLabel(user.status)} · 注册 ${fullTime(user.createdAt)}`;
+  $("#admin-detail-role").textContent = roleLabel(user.role);
+  $("#admin-quota-total").value = Number(user.quota?.total ?? 10);
+  $("#admin-quota-used").value = Number(user.quota?.used ?? 0);
+
+  const recordMap = {
+    projects: "项目",
+    conversations: "会话",
+    messages: "消息",
+    gallery: "作品",
+    galleryFolders: "文件夹",
+    favorites: "提示词",
+    assets: "素材",
+  };
+  const recordRows = Object.entries(recordMap).map(([key, label]) => ({
+    label,
+    value: Number(user.records?.[key] || 0),
+  }));
+  recordRows.unshift(
+    { label: "成功生成", value: Number(user.usage?.succeeded || 0) },
+    { label: "额度状态", value: quotaDisplay(user.quota) },
+  );
+  $("#admin-record-grid").innerHTML = recordRows.map((item) => `
+    <div class="admin-record-card">
+      <span>${escapeHtml(item.label)}</span>
+      <strong>${escapeHtml(item.value)}</strong>
+    </div>
+  `).join("");
+
+  const events = Array.isArray(user.recentUsage) ? user.recentUsage : [];
+  $("#admin-usage-list").innerHTML = events.length ? events.map((event) => `
+    <div class="admin-usage-row">
+      <div>
+        <strong>${escapeHtml(event.status === "succeeded" ? "生成成功" : event.status === "refunded" ? "已返还" : event.status)}</strong>
+        <span>${escapeHtml(event.input?.prompt || "无提示词记录")}</span>
+      </div>
+      <em>${escapeHtml(fullTime(event.createdAt))}</em>
+    </div>
+  `).join("") : `<div class="admin-empty inline">还没有生成事件。</div>`;
+}
+
+async function saveAdminQuota(resetUsed = false) {
+  const user = state.admin.selectedUser;
+  if (!user) return;
+  const quotaTotal = Number($("#admin-quota-total").value);
+  const quotaUsed = resetUsed ? 0 : Number($("#admin-quota-used").value);
+  $("#admin-save-quota-btn").disabled = true;
+  try {
+    const res = await fetch(`api/admin/users/${encodeURIComponent(user.id)}/quota`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ quotaTotal, quotaUsed }),
+    });
+    const data = await readApiJson(res, "保存次数失败");
+    state.admin.selectedUser = data.user;
+    const idx = state.admin.users.findIndex((item) => item.id === data.user.id);
+    if (idx >= 0) state.admin.users[idx] = { ...state.admin.users[idx], ...data.user };
+    if (state.auth.user?.id === data.user.id) {
+      state.auth.user.quota = data.user.quota;
+      renderAccount();
+    }
+    renderAdminUserList();
+    renderAdminDetail();
+    toast("次数配置已保存");
+  } catch (error) {
+    toast(error.message || "保存次数失败");
+  } finally {
+    $("#admin-save-quota-btn").disabled = false;
+  }
+}
+
+async function openAdminModal() {
+  if (!isGlobalAdminUser()) {
+    toast("需要管理员权限");
+    return;
+  }
+  openModal("admin-modal");
+  await loadAdminUsers();
 }
 
 function resetStoryboardStateOnly() {
@@ -2175,6 +2407,10 @@ function bindEvents() {
     applySettingsToModal();
     openModal("settings-modal");
   };
+  $("#open-admin-btn").onclick = openAdminModal;
+  $("#refresh-admin-btn").onclick = () => loadAdminUsers();
+  $("#admin-save-quota-btn").onclick = () => saveAdminQuota(false);
+  $("#admin-reset-used-btn").onclick = () => saveAdminQuota(true);
   $("#logout-btn").onclick = logoutCurrentUser;
   $("#save-settings-btn").onclick = saveSettingsFromModal;
   $("#send-btn").onclick = sendMessage;
@@ -2239,7 +2475,7 @@ function bindEvents() {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      for (const id of ["settings-modal", "projects-modal", "gallery-picker-modal", "folder-picker-modal", "folder-create-modal", "storyboard-modal", "edit-modal", "mark-modal", "assets-modal"]) closeModal(id);
+      for (const id of ["admin-modal", "settings-modal", "projects-modal", "gallery-picker-modal", "folder-picker-modal", "folder-create-modal", "storyboard-modal", "edit-modal", "mark-modal", "assets-modal"]) closeModal(id);
       setSidebarOpen(false);
       for (const [msgId, controller] of state.activeTasks) {
         const msg = state.messages.find((item) => item.id === msgId);
