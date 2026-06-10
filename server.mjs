@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { createHash, randomBytes, randomInt, scryptSync } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -17,6 +18,17 @@ const DEFAULT_IMAGE_MODEL = "gpt-image-2-chat";
 const DEFAULT_TOOL_MODEL = "gpt-image-2";
 const DEFAULT_ENHANCE_MODEL = "deepseek-v4-pro";
 const DEFAULT_PROJECT_ID = "project_default";
+const DEFAULT_ADMIN_USER_ID = "user_system_admin";
+const DEFAULT_ADMIN_EMAIL = "admin@picset.local";
+const DEFAULT_ADMIN_USERNAME = "admin";
+const SESSION_COOKIE_NAME = "picset_session";
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const VERIFICATION_TTL_MS = 10 * 60 * 1000;
+const VERIFICATION_RESEND_COOLDOWN_MS = 60 * 1000;
+const VERIFICATION_MAX_ATTEMPTS = 5;
+const VERIFICATION_EMAIL_HOURLY_LIMIT = 5;
+const VERIFICATION_IP_HOURLY_LIMIT = 20;
+const DEFAULT_BASE_PATH = "/picset";
 const DATA_STORES = new Set(["projects", "conversations", "messages", "gallery", "galleryFolders", "favorites", "assets"]);
 const IMAGE_MODEL_OPTIONS = [
   { id: DEFAULT_IMAGE_MODEL, name: "标准生成", desc: "默认通道 · 适合日常草稿", premium: false },
@@ -24,21 +36,243 @@ const IMAGE_MODEL_OPTIONS = [
 
 mkdirSync(dataDir, { recursive: true });
 const db = new DatabaseSync(dbFile);
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA foreign_keys = ON;
-  CREATE TABLE IF NOT EXISTS records (
-    store TEXT NOT NULL,
-    id TEXT NOT NULL,
-    project_id TEXT,
-    json TEXT NOT NULL,
-    created_at INTEGER NOT NULL DEFAULT 0,
-    updated_at INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (store, id)
+
+class HttpError extends Error {
+  constructor(status, message, code = "") {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function nowMs() {
+  return Date.now();
+}
+
+function storageId(prefix) {
+  return `${prefix}_${Date.now().toString(36)}_${randomBytes(6).toString("hex")}`;
+}
+
+function tableColumns(table) {
+  return new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name));
+}
+
+function addColumnIfMissing(table, column, definition) {
+  if (tableColumns(table).has(column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+function hashPassword(password) {
+  const salt = randomBytes(16).toString("base64url");
+  const key = scryptSync(String(password), salt, 64).toString("base64url");
+  return `scrypt$${salt}$${key}`;
+}
+
+function hashToken(token) {
+  return createHash("sha256").update(String(token)).digest("hex");
+}
+
+function writeAuditLog(action, entityType, entityId = "", projectId = "", detail = {}, actorId = DEFAULT_ADMIN_USER_ID) {
+  const ts = nowMs();
+  db.prepare(`
+    INSERT INTO audit_logs (id, actor_id, action, entity_type, entity_id, project_id, detail_json, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    storageId("audit"),
+    actorId || null,
+    action,
+    entityType,
+    entityId || null,
+    projectId || null,
+    JSON.stringify(detail || {}),
+    ts,
   );
-  CREATE INDEX IF NOT EXISTS idx_records_store_project ON records(store, project_id);
-  CREATE INDEX IF NOT EXISTS idx_records_updated ON records(store, updated_at);
-`);
+}
+
+function ensureProjectMember(projectId, userId = DEFAULT_ADMIN_USER_ID, role = "owner") {
+  if (!projectId || !userId) return;
+  const ts = nowMs();
+  db.prepare(`
+    INSERT INTO project_members (project_id, user_id, role, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(project_id, user_id) DO UPDATE SET
+      role = CASE
+        WHEN project_members.role = 'owner' THEN project_members.role
+        ELSE excluded.role
+      END,
+      updated_at = excluded.updated_at
+  `).run(projectId, userId, role, ts, ts);
+}
+
+function seedDefaultAdmin() {
+  const existing = db.prepare("SELECT id, password_hash FROM users WHERE id = ?").get(DEFAULT_ADMIN_USER_ID);
+  const config = loadConfig();
+  const username = pick(config, ["PICSET_ADMIN_USERNAME"], DEFAULT_ADMIN_USERNAME);
+  const email = pick(config, ["PICSET_ADMIN_EMAIL"], DEFAULT_ADMIN_EMAIL);
+  const displayName = pick(config, ["PICSET_ADMIN_DISPLAY_NAME"], "系统管理员");
+  const password = pick(config, ["PICSET_ADMIN_PASSWORD"], "");
+  const passwordHash = password ? hashPassword(password) : null;
+  const status = passwordHash ? "active" : "setup_required";
+  const ts = nowMs();
+
+  if (!existing) {
+    db.prepare(`
+      INSERT INTO users (id, username, email, password_hash, role, status, display_name, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'owner', ?, ?, ?, ?)
+    `).run(DEFAULT_ADMIN_USER_ID, username, email, passwordHash, status, displayName, ts, ts);
+    writeAuditLog("user.seeded", "user", DEFAULT_ADMIN_USER_ID, "", { username, status }, DEFAULT_ADMIN_USER_ID);
+    return;
+  }
+
+  if (!existing.password_hash && passwordHash) {
+    db.prepare(`
+      UPDATE users
+      SET username = ?, email = ?, password_hash = ?, status = 'active', display_name = ?, updated_at = ?
+      WHERE id = ?
+    `).run(username, email, passwordHash, displayName, ts, DEFAULT_ADMIN_USER_ID);
+    writeAuditLog("user.activated", "user", DEFAULT_ADMIN_USER_ID, "", { username }, DEFAULT_ADMIN_USER_ID);
+  }
+}
+
+function migrateRecordOwnership() {
+  const ts = nowMs();
+  const rows = db.prepare("SELECT store, id, project_id, json, owner_id, deleted_at FROM records").all();
+  const update = db.prepare(`
+    UPDATE records
+    SET project_id = ?, owner_id = ?, deleted_at = ?, json = ?, updated_at = ?
+    WHERE store = ? AND id = ?
+  `);
+
+  for (const row of rows) {
+    const record = parseRecord(row) || {};
+    const projectId = row.store === "projects"
+      ? row.id
+      : String(record.projectId || row.project_id || DEFAULT_PROJECT_ID);
+    const ownerId = String(record.ownerId || row.owner_id || DEFAULT_ADMIN_USER_ID);
+    const deletedAt = Number(record.deletedAt || row.deleted_at || 0);
+    const next = row.store === "projects"
+      ? { ...record, id: row.id, ownerId, createdAt: record.createdAt || ts, updatedAt: record.updatedAt || ts }
+      : { ...record, id: row.id, projectId, ownerId, createdAt: record.createdAt || ts, updatedAt: record.updatedAt || ts };
+
+    update.run(projectId, ownerId, deletedAt, JSON.stringify(next), Number(next.updatedAt || ts), row.store, row.id);
+    if (row.store === "projects") ensureProjectMember(row.id, ownerId, "owner");
+  }
+}
+
+function initializeStorage() {
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE IF NOT EXISTS records (
+      store TEXT NOT NULL,
+      id TEXT NOT NULL,
+      project_id TEXT,
+      owner_id TEXT,
+      json TEXT NOT NULL,
+      created_at INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0,
+      deleted_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (store, id)
+    );
+
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      username TEXT NOT NULL UNIQUE,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT,
+      role TEXT NOT NULL CHECK(role IN ('owner', 'admin', 'member', 'viewer')),
+      status TEXT NOT NULL CHECK(status IN ('active', 'disabled', 'setup_required')),
+      display_name TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      last_login_at INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      user_agent TEXT,
+      ip TEXT,
+      revoked_at INTEGER,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS project_members (
+      project_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('owner', 'admin', 'member', 'viewer')),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(project_id, user_id),
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id TEXT PRIMARY KEY,
+      actor_id TEXT,
+      action TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      entity_id TEXT,
+      project_id TEXT,
+      detail_json TEXT NOT NULL DEFAULT '{}',
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS generation_tasks (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      owner_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      status TEXT NOT NULL,
+      progress INTEGER NOT NULL DEFAULT 0,
+      input_json TEXT NOT NULL DEFAULT '{}',
+      output_json TEXT NOT NULL DEFAULT '{}',
+      error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      started_at INTEGER,
+      finished_at INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS email_verifications (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      purpose TEXT NOT NULL CHECK(purpose IN ('register', 'login')),
+      code_hash TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      sent_at INTEGER NOT NULL,
+      ip TEXT,
+      user_agent TEXT,
+      consumed_at INTEGER
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id);
+    CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
+    CREATE INDEX IF NOT EXISTS idx_generation_tasks_project ON generation_tasks(project_id, status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_email_verifications_email ON email_verifications(email, purpose, created_at);
+    CREATE INDEX IF NOT EXISTS idx_email_verifications_ip ON email_verifications(ip, sent_at);
+  `);
+
+  addColumnIfMissing("records", "owner_id", "TEXT");
+  addColumnIfMissing("records", "deleted_at", "INTEGER NOT NULL DEFAULT 0");
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_records_store_project ON records(store, project_id, deleted_at);
+    CREATE INDEX IF NOT EXISTS idx_records_owner_store ON records(owner_id, store, deleted_at);
+    CREATE INDEX IF NOT EXISTS idx_records_updated ON records(store, updated_at);
+  `);
+  seedDefaultAdmin();
+  migrateRecordOwnership();
+  ensureDefaultProject();
+}
 
 function parseRecord(row) {
   try {
@@ -48,29 +282,119 @@ function parseRecord(row) {
   }
 }
 
+function getUserById(userId) {
+  if (!userId) return null;
+  return db.prepare(`
+    SELECT
+      id,
+      username,
+      email,
+      role,
+      status,
+      display_name AS displayName,
+      created_at AS createdAt,
+      updated_at AS updatedAt,
+      last_login_at AS lastLoginAt
+    FROM users
+    WHERE id = ?
+  `).get(userId) || null;
+}
+
+function defaultActor() {
+  return getUserById(DEFAULT_ADMIN_USER_ID) || {
+    id: DEFAULT_ADMIN_USER_ID,
+    username: DEFAULT_ADMIN_USERNAME,
+    email: DEFAULT_ADMIN_EMAIL,
+    role: "owner",
+    status: "setup_required",
+    displayName: "系统管理员",
+  };
+}
+
+function actorOrDefault(actor) {
+  return actor?.id ? actor : defaultActor();
+}
+
+function publicUser(user) {
+  if (!user) return null;
+  return {
+    id: user.id,
+    username: user.username,
+    email: user.email,
+    role: user.role,
+    status: user.status,
+    displayName: user.displayName || user.display_name || user.username,
+  };
+}
+
+function isGlobalAdmin(user) {
+  return user?.role === "owner" || user?.role === "admin";
+}
+
+function projectMemberRole(projectId, userId) {
+  if (!projectId || !userId) return "";
+  return db.prepare("SELECT role FROM project_members WHERE project_id = ? AND user_id = ?")
+    .get(projectId, userId)?.role || "";
+}
+
+function canAccessProject(user, projectId) {
+  if (!user?.id || !projectId) return false;
+  if (isGlobalAdmin(user)) return true;
+  return Boolean(projectMemberRole(projectId, user.id));
+}
+
+function assertProjectAccess(user, projectId) {
+  if (canAccessProject(user, projectId)) return;
+  throw new HttpError(403, "没有这个项目的访问权限", "project_forbidden");
+}
+
+function activeHumanUserCount() {
+  return Number(db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM users
+    WHERE status = 'active' AND id != ?
+  `).get(DEFAULT_ADMIN_USER_ID)?.count || 0);
+}
+
+function getActiveRecordRow(store, id) {
+  return db.prepare("SELECT * FROM records WHERE store = ? AND id = ? AND deleted_at = 0").get(store, id) || null;
+}
+
 function getRecord(store, id) {
-  const row = db.prepare("SELECT json FROM records WHERE store = ? AND id = ?").get(store, id);
+  const row = db.prepare("SELECT json FROM records WHERE store = ? AND id = ? AND deleted_at = 0").get(store, id);
   return row ? parseRecord(row) : null;
 }
 
-function putRecord(store, record) {
+function putRecord(store, record, actor = null) {
   if (!DATA_STORES.has(store)) throw new Error(`unsupported store: ${store}`);
   if (!record || typeof record !== "object") throw new Error("record must be an object");
+  const user = actorOrDefault(actor);
   const id = String(record.id || "").trim();
   if (!id) throw new Error("record.id is required");
-  const createdAt = Number(record.createdAt || Date.now());
-  const updatedAt = Number(record.updatedAt || record.createdAt || Date.now());
+  const createdAt = Number(record.createdAt || nowMs());
+  const updatedAt = Number(record.updatedAt || record.createdAt || nowMs());
+  const existing = getActiveRecordRow(store, id);
   const projectId = store === "projects" ? id : String(record.projectId || DEFAULT_PROJECT_ID);
-  const next = store === "projects" ? { ...record, id, createdAt, updatedAt } : { ...record, id, projectId, createdAt, updatedAt };
+  if (existing) assertProjectAccess(user, store === "projects" ? id : projectId);
+  if (store !== "projects") assertProjectAccess(user, projectId);
+  const ownerId = String(existing?.owner_id || user.id || DEFAULT_ADMIN_USER_ID);
+  const deletedAt = Number(record.deletedAt || 0);
+  const next = store === "projects"
+    ? { ...record, id, ownerId, createdAt, updatedAt }
+    : { ...record, id, projectId, ownerId, createdAt, updatedAt };
   db.prepare(`
-    INSERT INTO records (store, id, project_id, json, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO records (store, id, project_id, owner_id, json, created_at, updated_at, deleted_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(store, id) DO UPDATE SET
       project_id = excluded.project_id,
+      owner_id = excluded.owner_id,
       json = excluded.json,
       created_at = excluded.created_at,
-      updated_at = excluded.updated_at
-  `).run(store, id, projectId, JSON.stringify(next), createdAt, updatedAt);
+      updated_at = excluded.updated_at,
+      deleted_at = excluded.deleted_at
+  `).run(store, id, projectId, ownerId, JSON.stringify(next), createdAt, updatedAt, deletedAt);
+  if (store === "projects" && !existing) ensureProjectMember(id, user.id, "owner");
+  writeAuditLog("record.upserted", store, id, projectId, { ownerId }, user.id);
   return next;
 }
 
@@ -86,35 +410,185 @@ function ensureDefaultProject() {
   });
 }
 
-function listRecords(store, projectId = "") {
+function ensureUserProject(user) {
+  const actor = actorOrDefault(user);
+  ensureDefaultProject();
+  if (isGlobalAdmin(actor)) return DEFAULT_PROJECT_ID;
+  const existing = db.prepare(`
+    SELECT pm.project_id AS projectId
+    FROM project_members pm
+    JOIN records r ON r.store = 'projects' AND r.id = pm.project_id AND r.deleted_at = 0
+    WHERE pm.user_id = ?
+    ORDER BY r.updated_at DESC, r.created_at DESC
+    LIMIT 1
+  `).get(actor.id);
+  if (existing?.projectId) return existing.projectId;
+  const ts = nowMs();
+  const project = putRecord("projects", {
+    id: storageId("project"),
+    name: "我的项目",
+    description: "邮箱注册后自动创建的个人工作区",
+    createdAt: ts,
+    updatedAt: ts,
+  }, actor);
+  return project.id;
+}
+
+function resolveProjectIdForUser(user, requestedProjectId = "") {
+  const actor = actorOrDefault(user);
+  ensureUserProject(actor);
+  const requested = String(requestedProjectId || "").trim();
+  if (requested && getRecord("projects", requested) && canAccessProject(actor, requested)) return requested;
+  const first = listRecords("projects", "", actor)[0];
+  return first?.id || ensureUserProject(actor);
+}
+
+function listRecords(store, projectId = "", actor = null) {
   if (!DATA_STORES.has(store)) throw new Error(`unsupported store: ${store}`);
-  const rows = store === "projects" || !projectId
-    ? db.prepare("SELECT json FROM records WHERE store = ? ORDER BY updated_at DESC, created_at DESC").all(store)
-    : db.prepare("SELECT json FROM records WHERE store = ? AND project_id = ? ORDER BY updated_at DESC, created_at DESC").all(store, projectId);
+  const user = actorOrDefault(actor);
+  let rows = [];
+  if (store === "projects") {
+    rows = isGlobalAdmin(user)
+      ? db.prepare("SELECT json FROM records WHERE store = 'projects' AND deleted_at = 0 ORDER BY updated_at DESC, created_at DESC").all()
+      : db.prepare(`
+          SELECT r.json
+          FROM records r
+          JOIN project_members pm ON pm.project_id = r.id AND pm.user_id = ?
+          WHERE r.store = 'projects' AND r.deleted_at = 0
+          ORDER BY r.updated_at DESC, r.created_at DESC
+        `).all(user.id);
+    return rows.map(parseRecord).filter(Boolean);
+  }
+  const requested = String(projectId || "").trim();
+  if (requested) {
+    assertProjectAccess(user, requested);
+    rows = db.prepare("SELECT json FROM records WHERE store = ? AND project_id = ? AND deleted_at = 0 ORDER BY updated_at DESC, created_at DESC").all(store, requested);
+  } else if (isGlobalAdmin(user)) {
+    rows = db.prepare("SELECT json FROM records WHERE store = ? AND deleted_at = 0 ORDER BY updated_at DESC, created_at DESC").all(store);
+  } else {
+    rows = db.prepare(`
+      SELECT r.json
+      FROM records r
+      JOIN project_members pm ON pm.project_id = r.project_id AND pm.user_id = ?
+      WHERE r.store = ? AND r.deleted_at = 0
+      ORDER BY r.updated_at DESC, r.created_at DESC
+    `).all(user.id, store);
+  }
   return rows.map(parseRecord).filter(Boolean);
 }
 
-function deleteRecord(store, id) {
+function deleteRecord(store, id, actor = null) {
   if (!DATA_STORES.has(store)) throw new Error(`unsupported store: ${store}`);
-  db.prepare("DELETE FROM records WHERE store = ? AND id = ?").run(store, id);
+  const user = actorOrDefault(actor);
+  const row = db.prepare("SELECT project_id, owner_id, json FROM records WHERE store = ? AND id = ? AND deleted_at = 0").get(store, id);
+  if (!row) return;
+  assertProjectAccess(user, store === "projects" ? id : row.project_id);
+  const ts = nowMs();
+  const record = parseRecord(row) || {};
+  const next = { ...record, deletedAt: ts, updatedAt: ts };
+  db.prepare("UPDATE records SET json = ?, updated_at = ?, deleted_at = ? WHERE store = ? AND id = ?")
+    .run(JSON.stringify(next), ts, ts, store, id);
+  writeAuditLog("record.deleted", store, id, row.project_id || "", { ownerId: row.owner_id || DEFAULT_ADMIN_USER_ID }, user.id);
 }
 
-function clearRecords(store, projectId = "") {
+function clearRecords(store, projectId = "", actor = null) {
   if (!DATA_STORES.has(store)) throw new Error(`unsupported store: ${store}`);
   if (store === "projects") throw new Error("projects cannot be cleared");
-  if (projectId) db.prepare("DELETE FROM records WHERE store = ? AND project_id = ?").run(store, projectId);
-  else db.prepare("DELETE FROM records WHERE store = ?").run(store);
+  const user = actorOrDefault(actor);
+  const requested = String(projectId || "").trim();
+  let rows = [];
+  if (requested) {
+    assertProjectAccess(user, requested);
+    rows = db.prepare("SELECT id FROM records WHERE store = ? AND project_id = ? AND deleted_at = 0").all(store, requested);
+  } else if (isGlobalAdmin(user)) {
+    rows = db.prepare("SELECT id FROM records WHERE store = ? AND deleted_at = 0").all(store);
+  } else {
+    rows = db.prepare(`
+      SELECT r.id
+      FROM records r
+      JOIN project_members pm ON pm.project_id = r.project_id AND pm.user_id = ?
+      WHERE r.store = ? AND r.deleted_at = 0
+    `).all(user.id, store);
+  }
+  for (const row of rows) deleteRecord(store, row.id, user);
 }
 
-function bootstrapData(projectId = DEFAULT_PROJECT_ID) {
-  ensureDefaultProject();
-  const data = { projects: listRecords("projects") };
+function bootstrapData(projectId = DEFAULT_PROJECT_ID, actor = null) {
+  const user = actorOrDefault(actor);
+  const resolvedProjectId = resolveProjectIdForUser(user, projectId);
+  const data = { projects: listRecords("projects", "", user) };
   for (const store of DATA_STORES) {
     if (store === "projects") continue;
-    data[store] = listRecords(store, projectId);
+    data[store] = listRecords(store, resolvedProjectId, user);
   }
-  data.defaultProjectId = projectId;
+  data.defaultProjectId = resolvedProjectId;
   return data;
+}
+
+function fileBytes(path) {
+  try {
+    return existsSync(path) ? statSync(path).size : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function scalarCount(sql, params = []) {
+  return Number(db.prepare(sql).get(...params)?.count || 0);
+}
+
+function groupedCounts(sql) {
+  return db.prepare(sql).all().map((row) => {
+    const next = {};
+    for (const [key, value] of Object.entries(row)) {
+      next[key] = typeof value === "number" ? value : value ?? "";
+    }
+    return next;
+  });
+}
+
+function storageOverview() {
+  return {
+    database: {
+      sqlite: true,
+      dbBytes: fileBytes(dbFile),
+      walBytes: fileBytes(`${dbFile}-wal`),
+      shmBytes: fileBytes(`${dbFile}-shm`),
+    },
+    users: {
+      total: scalarCount("SELECT COUNT(*) AS count FROM users"),
+      byRole: groupedCounts("SELECT role, COUNT(*) AS count FROM users GROUP BY role ORDER BY role"),
+      byStatus: groupedCounts("SELECT status, COUNT(*) AS count FROM users GROUP BY status ORDER BY status"),
+    },
+    projects: {
+      total: scalarCount("SELECT COUNT(*) AS count FROM records WHERE store = 'projects' AND deleted_at = 0"),
+      members: scalarCount("SELECT COUNT(*) AS count FROM project_members"),
+    },
+    records: {
+      total: scalarCount("SELECT COUNT(*) AS count FROM records WHERE deleted_at = 0"),
+      deleted: scalarCount("SELECT COUNT(*) AS count FROM records WHERE deleted_at > 0"),
+      byStore: groupedCounts(`
+        SELECT store,
+          SUM(CASE WHEN deleted_at = 0 THEN 1 ELSE 0 END) AS active,
+          SUM(CASE WHEN deleted_at > 0 THEN 1 ELSE 0 END) AS deleted
+        FROM records
+        GROUP BY store
+        ORDER BY store
+      `),
+    },
+    tasks: {
+      total: scalarCount("SELECT COUNT(*) AS count FROM generation_tasks"),
+      byStatus: groupedCounts("SELECT status, COUNT(*) AS count FROM generation_tasks GROUP BY status ORDER BY status"),
+    },
+    emailVerifications: {
+      total: scalarCount("SELECT COUNT(*) AS count FROM email_verifications"),
+      active: scalarCount("SELECT COUNT(*) AS count FROM email_verifications WHERE consumed_at IS NULL AND expires_at > ?", [nowMs()]),
+    },
+    auditLogs: {
+      total: scalarCount("SELECT COUNT(*) AS count FROM audit_logs"),
+      latestAt: Number(db.prepare("SELECT MAX(created_at) AS latestAt FROM audit_logs").get()?.latestAt || 0),
+    },
+  };
 }
 
 function parseEnvFile(path) {
@@ -151,6 +625,344 @@ function pick(config, names, fallback = "") {
   return fallback;
 }
 
+function authConfig() {
+  const config = loadConfig();
+  const authRequiredRaw = pick(config, ["PICSET_AUTH_REQUIRED"], "1").toLowerCase();
+  return {
+    authRequired: !["0", "false", "no", "off"].includes(authRequiredRaw),
+    appName: pick(config, ["PICSET_APP_NAME"], "PicSet"),
+    basePath: normalizeBasePath(pick(config, ["PICSET_BASE_PATH"], DEFAULT_BASE_PATH)),
+    resendApiKey: pick(config, ["RESEND_API_KEY"], ""),
+    resendFrom: pick(config, ["RESEND_FROM"], ""),
+    resendReplyTo: pick(config, ["RESEND_REPLY_TO"], ""),
+    authSecret: pick(config, ["PICSET_AUTH_SECRET", "PICSET_SESSION_SECRET", "RESEND_API_KEY", "VSLLM_API_KEY", "OPENAI_API_KEY"], "picset-local-dev-secret"),
+    devAuthCode: ["1", "true", "yes"].includes(pick(config, ["PICSET_DEV_AUTH_CODE"], "").toLowerCase()),
+    cookieSecure: ["1", "true", "yes"].includes(pick(config, ["PICSET_COOKIE_SECURE"], "").toLowerCase()),
+  };
+}
+
+function normalizeBasePath(path) {
+  const raw = String(path || "").trim();
+  if (!raw || raw === "/") return "";
+  return `/${raw.replace(/^\/+|\/+$/g, "")}`;
+}
+
+function normalizeRequestPath(pathname) {
+  const basePath = authConfig().basePath;
+  if (basePath && (pathname === basePath || pathname.startsWith(`${basePath}/`))) {
+    return pathname.slice(basePath.length) || "/";
+  }
+  return pathname;
+}
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function normalizeUsername(username, email = "") {
+  const local = normalizeEmail(email).split("@")[0] || "user";
+  const base = String(username || local)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_\-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 32) || `user_${randomBytes(3).toString("hex")}`;
+  return base.length >= 3 ? base : `${base}_${randomBytes(2).toString("hex")}`;
+}
+
+function uniqueUsername(username, email = "") {
+  const base = normalizeUsername(username, email);
+  let candidate = base;
+  for (let i = 0; i < 20; i++) {
+    const existing = db.prepare("SELECT id FROM users WHERE username = ?").get(candidate);
+    if (!existing) return candidate;
+    candidate = `${base}_${randomInt(1000, 9999)}`;
+  }
+  return `${base}_${Date.now().toString(36)}`;
+}
+
+function requestIp(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return forwarded || req.socket?.remoteAddress || "";
+}
+
+function parseCookies(req) {
+  const raw = String(req.headers.cookie || "");
+  const cookies = {};
+  for (const part of raw.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx < 0) continue;
+    const key = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (key) cookies[key] = decodeURIComponent(value);
+  }
+  return cookies;
+}
+
+function secureCookieForRequest(req, cfg = authConfig()) {
+  const proto = String(req.headers["x-forwarded-proto"] || "").toLowerCase();
+  return cfg.cookieSecure || proto === "https";
+}
+
+function sessionCookie(token, req) {
+  const maxAge = Math.floor(SESSION_TTL_MS / 1000);
+  const parts = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    "HttpOnly",
+    "SameSite=Lax",
+    "Path=/",
+    `Max-Age=${maxAge}`,
+  ];
+  if (secureCookieForRequest(req)) parts.push("Secure");
+  return parts.join("; ");
+}
+
+function clearSessionCookie(req) {
+  const parts = [
+    `${SESSION_COOKIE_NAME}=`,
+    "HttpOnly",
+    "SameSite=Lax",
+    "Path=/",
+    "Max-Age=0",
+  ];
+  if (secureCookieForRequest(req)) parts.push("Secure");
+  return parts.join("; ");
+}
+
+function codeHash(email, purpose, code) {
+  const cfg = authConfig();
+  return hashToken(`${cfg.authSecret}:${purpose}:${normalizeEmail(email)}:${String(code).trim()}`);
+}
+
+function createVerificationCode() {
+  return String(randomInt(100000, 1000000));
+}
+
+function assertVerificationRateLimit(email, purpose, req) {
+  const ts = nowMs();
+  const recent = db.prepare(`
+    SELECT MAX(sent_at) AS latest
+    FROM email_verifications
+    WHERE email = ? AND purpose = ? AND sent_at > ?
+  `).get(email, purpose, ts - VERIFICATION_RESEND_COOLDOWN_MS);
+  if (recent?.latest) {
+    const retryAfter = Math.max(1, Math.ceil((recent.latest + VERIFICATION_RESEND_COOLDOWN_MS - ts) / 1000));
+    throw new HttpError(429, `验证码发送过于频繁，请 ${retryAfter} 秒后再试`, "code_cooldown");
+  }
+
+  const emailCount = Number(db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM email_verifications
+    WHERE email = ? AND sent_at > ?
+  `).get(email, ts - 60 * 60 * 1000)?.count || 0);
+  if (emailCount >= VERIFICATION_EMAIL_HOURLY_LIMIT) {
+    throw new HttpError(429, "这个邮箱一小时内发送次数过多，请稍后再试", "email_rate_limited");
+  }
+
+  const ip = requestIp(req);
+  const ipCount = Number(db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM email_verifications
+    WHERE ip = ? AND sent_at > ?
+  `).get(ip, ts - 60 * 60 * 1000)?.count || 0);
+  if (ip && ipCount >= VERIFICATION_IP_HOURLY_LIMIT) {
+    throw new HttpError(429, "当前网络发送次数过多，请稍后再试", "ip_rate_limited");
+  }
+}
+
+function insertVerification(email, purpose, code, req) {
+  const ts = nowMs();
+  const expiresAt = ts + VERIFICATION_TTL_MS;
+  const id = storageId("verify");
+  db.prepare(`
+    INSERT INTO email_verifications (id, email, purpose, code_hash, attempts, expires_at, created_at, sent_at, ip, user_agent, consumed_at)
+    VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, NULL)
+  `).run(
+    id,
+    email,
+    purpose,
+    codeHash(email, purpose, code),
+    expiresAt,
+    ts,
+    ts,
+    requestIp(req),
+    String(req.headers["user-agent"] || "").slice(0, 500),
+  );
+  return { id, expiresAt };
+}
+
+function deleteVerification(id) {
+  if (!id) return;
+  db.prepare("DELETE FROM email_verifications WHERE id = ? AND consumed_at IS NULL").run(id);
+}
+
+async function sendVerificationEmail(email, purpose, code) {
+  const cfg = authConfig();
+  if (!cfg.resendApiKey || !cfg.resendFrom) {
+    if (cfg.devAuthCode) return { dev: true };
+    throw new HttpError(503, "Resend 未配置，请设置 RESEND_API_KEY 和 RESEND_FROM", "resend_not_configured");
+  }
+  const title = purpose === "register" ? "注册验证码" : "登录验证码";
+  const subject = `${cfg.appName} ${title}`;
+  const escapedCode = String(code).replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;",
+  })[ch]);
+  const payload = {
+    from: cfg.resendFrom,
+    to: email,
+    subject,
+    text: `${cfg.appName} ${title}：${code}\n验证码 10 分钟内有效。若非本人操作，请忽略这封邮件。`,
+    html: `
+      <div style="font-family:Arial,sans-serif;line-height:1.6;color:#17201a">
+        <h2 style="margin:0 0 12px">${cfg.appName} ${title}</h2>
+        <p>你的验证码是：</p>
+        <p style="font-size:28px;font-weight:700;letter-spacing:6px;margin:16px 0">${escapedCode}</p>
+        <p>验证码 10 分钟内有效。若非本人操作，请忽略这封邮件。</p>
+      </div>
+    `,
+  };
+  if (cfg.resendReplyTo) payload.reply_to = cfg.resendReplyTo;
+  const upstream = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${cfg.resendApiKey}`,
+      "Content-Type": "application/json",
+      "User-Agent": "picset-auth/1.0",
+    },
+    body: JSON.stringify(payload),
+  });
+  const raw = await upstream.text();
+  if (!upstream.ok) {
+    let message = raw.slice(0, 800) || `Resend HTTP ${upstream.status}`;
+    try {
+      const json = JSON.parse(raw);
+      message = json?.message || json?.error?.message || message;
+    } catch {}
+    throw new HttpError(502, `Resend 发送失败：${message}`, "resend_send_failed");
+  }
+  return { dev: false };
+}
+
+function latestVerification(email, purpose) {
+  return db.prepare(`
+    SELECT *
+    FROM email_verifications
+    WHERE email = ? AND purpose = ? AND consumed_at IS NULL
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(email, purpose) || null;
+}
+
+function verifyEmailCode(email, purpose, code) {
+  const row = latestVerification(email, purpose);
+  if (!row) throw new HttpError(400, "验证码不存在或已过期，请重新发送", "code_missing");
+  const ts = nowMs();
+  if (row.expires_at <= ts) throw new HttpError(400, "验证码已过期，请重新发送", "code_expired");
+  if (Number(row.attempts || 0) >= VERIFICATION_MAX_ATTEMPTS) {
+    throw new HttpError(429, "验证码尝试次数过多，请重新发送", "code_attempts_exceeded");
+  }
+  if (row.code_hash !== codeHash(email, purpose, code)) {
+    db.prepare("UPDATE email_verifications SET attempts = attempts + 1 WHERE id = ?").run(row.id);
+    throw new HttpError(400, "验证码不正确", "code_invalid");
+  }
+  db.prepare("UPDATE email_verifications SET consumed_at = ? WHERE id = ?").run(ts, row.id);
+}
+
+function createSession(user, req) {
+  const token = randomBytes(32).toString("base64url");
+  const ts = nowMs();
+  const expiresAt = ts + SESSION_TTL_MS;
+  db.prepare(`
+    INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, updated_at, user_agent, ip, revoked_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+  `).run(
+    storageId("sess"),
+    user.id,
+    hashToken(token),
+    expiresAt,
+    ts,
+    ts,
+    String(req.headers["user-agent"] || "").slice(0, 500),
+    requestIp(req),
+  );
+  db.prepare("UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?").run(ts, ts, user.id);
+  writeAuditLog("session.created", "user", user.id, "", { ip: requestIp(req) }, user.id);
+  return token;
+}
+
+function getSessionFromRequest(req) {
+  const token = parseCookies(req)[SESSION_COOKIE_NAME];
+  if (!token) return null;
+  return db.prepare(`
+    SELECT s.id AS sessionId, s.user_id AS userId, u.id, u.username, u.email, u.role, u.status,
+      u.display_name AS displayName, u.created_at AS createdAt, u.updated_at AS updatedAt, u.last_login_at AS lastLoginAt
+    FROM sessions s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?
+    LIMIT 1
+  `).get(hashToken(token), nowMs()) || null;
+}
+
+function currentUserFromRequest(req) {
+  const cfg = authConfig();
+  const session = getSessionFromRequest(req);
+  if (session?.id && session.status === "active") return session;
+  if (!cfg.authRequired) return defaultActor();
+  return null;
+}
+
+function requireCurrentUser(req) {
+  const user = currentUserFromRequest(req);
+  if (!user) throw new HttpError(401, "请先登录", "auth_required");
+  return user;
+}
+
+function revokeSession(req) {
+  const token = parseCookies(req)[SESSION_COOKIE_NAME];
+  if (!token) return;
+  db.prepare("UPDATE sessions SET revoked_at = ?, updated_at = ? WHERE token_hash = ? AND revoked_at IS NULL")
+    .run(nowMs(), nowMs(), hashToken(token));
+}
+
+function userByEmail(email) {
+  return db.prepare(`
+    SELECT id, username, email, role, status, display_name AS displayName, created_at AS createdAt, updated_at AS updatedAt, last_login_at AS lastLoginAt
+    FROM users
+    WHERE email = ?
+  `).get(email) || null;
+}
+
+function createUserFromRegistration(email, input = {}) {
+  const ts = nowMs();
+  const firstHuman = activeHumanUserCount() === 0;
+  const role = firstHuman ? "owner" : "member";
+  const user = {
+    id: storageId("user"),
+    username: uniqueUsername(input.username, email),
+    email,
+    role,
+    status: "active",
+    displayName: String(input.displayName || input.username || email.split("@")[0]).trim().slice(0, 80),
+  };
+  db.prepare(`
+    INSERT INTO users (id, username, email, password_hash, role, status, display_name, created_at, updated_at, last_login_at)
+    VALUES (?, ?, ?, NULL, ?, 'active', ?, ?, ?, NULL)
+  `).run(user.id, user.username, user.email, user.role, user.displayName, ts, ts);
+  writeAuditLog("user.registered", "user", user.id, "", { email, role }, user.id);
+  if (firstHuman) {
+    const projects = db.prepare("SELECT id FROM records WHERE store = 'projects' AND deleted_at = 0").all();
+    for (const project of projects) ensureProjectMember(project.id, user.id, "owner");
+  } else {
+    ensureUserProject(user);
+  }
+  return getUserById(user.id);
+}
+
 function normalizeApiBaseUrl(raw) {
   let url = String(raw || DEFAULT_API_BASE).trim();
   if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
@@ -174,11 +986,12 @@ function getRuntimeConfig(overrides = {}) {
   return { apiKey, baseUrl, imageModel, toolModel, enhanceModel };
 }
 
-function sendJson(res, status, data) {
+function sendJson(res, status, data, headers = {}) {
   const body = JSON.stringify(data);
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(body),
+    ...headers,
   });
   res.end(body);
 }
@@ -190,6 +1003,103 @@ async function readJson(req) {
     if (body.length > 30 * 1024 * 1024) throw new Error("request body too large");
   }
   return body ? JSON.parse(body) : {};
+}
+
+async function sendAuthCode(req, res, purpose) {
+  const input = await readJson(req);
+  const email = normalizeEmail(input.email);
+  if (!isValidEmail(email)) throw new HttpError(400, "请输入有效邮箱", "invalid_email");
+  const existing = userByEmail(email);
+  if (purpose === "register" && existing) {
+    const message = existing.status === "active" ? "该邮箱已注册，请直接登录" : "该邮箱已存在但不可注册，请联系管理员";
+    throw new HttpError(409, message, "email_registered");
+  }
+  if (purpose === "login" && (!existing || existing.status !== "active")) {
+    throw new HttpError(404, "该邮箱还没有可登录账号，请先注册", "email_not_registered");
+  }
+  assertVerificationRateLimit(email, purpose, req);
+  const code = createVerificationCode();
+  const verification = insertVerification(email, purpose, code, req);
+  let sent;
+  try {
+    sent = await sendVerificationEmail(email, purpose, code);
+  } catch (error) {
+    deleteVerification(verification.id);
+    throw error;
+  }
+  writeAuditLog("auth.code_sent", "user", existing?.id || "", "", { email, purpose }, existing?.id || DEFAULT_ADMIN_USER_ID);
+  const data = {
+    ok: true,
+    email,
+    purpose,
+    cooldownSeconds: Math.ceil(VERIFICATION_RESEND_COOLDOWN_MS / 1000),
+    expiresInSeconds: Math.ceil((verification.expiresAt - nowMs()) / 1000),
+    resendConfigured: !sent.dev,
+  };
+  if (sent.dev) data.devCode = code;
+  sendJson(res, 200, data);
+}
+
+async function verifyRegistration(req, res) {
+  const input = await readJson(req);
+  const email = normalizeEmail(input.email);
+  const code = String(input.code || "").trim();
+  if (!isValidEmail(email)) throw new HttpError(400, "请输入有效邮箱", "invalid_email");
+  if (!/^\d{6}$/.test(code)) throw new HttpError(400, "请输入 6 位验证码", "invalid_code");
+  const existing = userByEmail(email);
+  if (existing) {
+    const message = existing.status === "active" ? "该邮箱已注册，请直接登录" : "该邮箱已存在但不可注册，请联系管理员";
+    throw new HttpError(409, message, "email_registered");
+  }
+  verifyEmailCode(email, "register", code);
+  const user = createUserFromRegistration(email, input);
+  const token = createSession(user, req);
+  const defaultProjectId = resolveProjectIdForUser(user, input.projectId || "");
+  sendJson(res, 200, {
+    ok: true,
+    authenticated: true,
+    user: publicUser(user),
+    defaultProjectId,
+  }, { "Set-Cookie": sessionCookie(token, req) });
+}
+
+async function verifyLogin(req, res) {
+  const input = await readJson(req);
+  const email = normalizeEmail(input.email);
+  const code = String(input.code || "").trim();
+  if (!isValidEmail(email)) throw new HttpError(400, "请输入有效邮箱", "invalid_email");
+  if (!/^\d{6}$/.test(code)) throw new HttpError(400, "请输入 6 位验证码", "invalid_code");
+  const user = userByEmail(email);
+  if (!user || user.status !== "active") throw new HttpError(404, "该邮箱还没有可登录账号，请先注册", "email_not_registered");
+  verifyEmailCode(email, "login", code);
+  const token = createSession(user, req);
+  const defaultProjectId = resolveProjectIdForUser(user, input.projectId || "");
+  sendJson(res, 200, {
+    ok: true,
+    authenticated: true,
+    user: publicUser(user),
+    defaultProjectId,
+  }, { "Set-Cookie": sessionCookie(token, req) });
+}
+
+function sendAuthMe(req, res) {
+  const cfg = authConfig();
+  const user = currentUserFromRequest(req);
+  sendJson(res, 200, {
+    authenticated: Boolean(user),
+    authRequired: cfg.authRequired,
+    resendConfigured: Boolean(cfg.resendApiKey && cfg.resendFrom),
+    devAuthCode: cfg.devAuthCode,
+    user: publicUser(user),
+    defaultProjectId: user ? resolveProjectIdForUser(user, "") : DEFAULT_PROJECT_ID,
+  });
+}
+
+function logout(req, res) {
+  const user = currentUserFromRequest(req);
+  revokeSession(req);
+  if (user) writeAuditLog("session.revoked", "user", user.id, "", { ip: requestIp(req) }, user.id);
+  sendJson(res, 200, { ok: true }, { "Set-Cookie": clearSessionCookie(req) });
 }
 
 function mimeType(path) {
@@ -679,54 +1589,33 @@ async function buildStoryboard(req, res) {
 
 async function route(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
+  const requestPath = normalizeRequestPath(url.pathname);
   try {
-    if (req.method === "GET" && url.pathname === "/api/data/bootstrap") {
-      sendJson(res, 200, bootstrapData(url.searchParams.get("projectId") || DEFAULT_PROJECT_ID));
+    if (req.method === "GET" && requestPath === "/api/auth/me") {
+      sendAuthMe(req, res);
       return;
     }
-    if (req.method === "POST" && url.pathname === "/api/data/bootstrap") {
-      const input = await readJson(req);
-      const projectId = input.projectId || DEFAULT_PROJECT_ID;
-      const stores = input.stores && typeof input.stores === "object" ? input.stores : {};
-      ensureDefaultProject();
-      for (const store of DATA_STORES) {
-        const records = Array.isArray(stores[store]) ? stores[store] : [];
-        for (const record of records) {
-          putRecord(store, store === "projects" ? record : { ...record, projectId: record.projectId || projectId });
-        }
-      }
-      sendJson(res, 200, bootstrapData(projectId));
+    if (req.method === "POST" && requestPath === "/api/auth/register/send-code") {
+      await sendAuthCode(req, res, "register");
       return;
     }
-    const dataStoreMatch = url.pathname.match(/^\/api\/data\/([^/]+)(?:\/([^/]+))?$/);
-    if (dataStoreMatch) {
-      const store = dataStoreMatch[1];
-      const id = dataStoreMatch[2] ? decodeURIComponent(dataStoreMatch[2]) : "";
-      if (!DATA_STORES.has(store)) {
-        sendJson(res, 404, { error: "unknown data store" });
-        return;
-      }
-      if (req.method === "GET") {
-        sendJson(res, 200, { items: listRecords(store, url.searchParams.get("projectId") || "") });
-        return;
-      }
-      if (req.method === "POST") {
-        const record = await readJson(req);
-        sendJson(res, 200, { item: putRecord(store, record) });
-        return;
-      }
-      if (req.method === "DELETE" && id) {
-        deleteRecord(store, id);
-        sendJson(res, 200, { ok: true });
-        return;
-      }
-      if (req.method === "DELETE") {
-        clearRecords(store, url.searchParams.get("projectId") || "");
-        sendJson(res, 200, { ok: true });
-        return;
-      }
+    if (req.method === "POST" && requestPath === "/api/auth/register/verify") {
+      await verifyRegistration(req, res);
+      return;
     }
-    if (req.method === "GET" && url.pathname === "/api/config") {
+    if (req.method === "POST" && requestPath === "/api/auth/login/send-code") {
+      await sendAuthCode(req, res, "login");
+      return;
+    }
+    if (req.method === "POST" && requestPath === "/api/auth/login/verify") {
+      await verifyLogin(req, res);
+      return;
+    }
+    if (req.method === "POST" && requestPath === "/api/auth/logout") {
+      logout(req, res);
+      return;
+    }
+    if (req.method === "GET" && requestPath === "/api/config") {
       const cfg = getRuntimeConfig();
       sendJson(res, 200, {
         hasKey: Boolean(cfg.apiKey),
@@ -739,20 +1628,78 @@ async function route(req, res) {
       });
       return;
     }
-    if (req.method === "POST" && url.pathname === "/api/generate") {
+    if (req.method === "GET" && requestPath === "/api/data/bootstrap") {
+      const user = requireCurrentUser(req);
+      sendJson(res, 200, bootstrapData(url.searchParams.get("projectId") || DEFAULT_PROJECT_ID, user));
+      return;
+    }
+    if (req.method === "POST" && requestPath === "/api/data/bootstrap") {
+      const user = requireCurrentUser(req);
+      const input = await readJson(req);
+      const projectId = input.projectId || DEFAULT_PROJECT_ID;
+      const stores = input.stores && typeof input.stores === "object" ? input.stores : {};
+      const resolvedProjectId = resolveProjectIdForUser(user, projectId);
+      for (const store of DATA_STORES) {
+        const records = Array.isArray(stores[store]) ? stores[store] : [];
+        for (const record of records) {
+          putRecord(store, store === "projects" ? record : { ...record, projectId: resolvedProjectId }, user);
+        }
+      }
+      sendJson(res, 200, bootstrapData(resolvedProjectId, user));
+      return;
+    }
+    const dataStoreMatch = requestPath.match(/^\/api\/data\/([^/]+)(?:\/([^/]+))?$/);
+    if (dataStoreMatch) {
+      const user = requireCurrentUser(req);
+      const store = dataStoreMatch[1];
+      const id = dataStoreMatch[2] ? decodeURIComponent(dataStoreMatch[2]) : "";
+      if (!DATA_STORES.has(store)) {
+        sendJson(res, 404, { error: "unknown data store" });
+        return;
+      }
+      if (req.method === "GET") {
+        sendJson(res, 200, { items: listRecords(store, url.searchParams.get("projectId") || "", user) });
+        return;
+      }
+      if (req.method === "POST") {
+        const record = await readJson(req);
+        sendJson(res, 200, { item: putRecord(store, record, user) });
+        return;
+      }
+      if (req.method === "DELETE" && id) {
+        deleteRecord(store, id, user);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      if (req.method === "DELETE") {
+        clearRecords(store, url.searchParams.get("projectId") || "", user);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+    }
+    if (req.method === "GET" && requestPath === "/api/admin/storage/overview") {
+      const user = requireCurrentUser(req);
+      if (!isGlobalAdmin(user)) throw new HttpError(403, "需要管理员权限", "admin_required");
+      sendJson(res, 200, storageOverview());
+      return;
+    }
+    if (req.method === "POST" && requestPath === "/api/generate") {
+      requireCurrentUser(req);
       await proxyGenerate(req, res);
       return;
     }
-    if (req.method === "POST" && url.pathname === "/api/enhance") {
+    if (req.method === "POST" && requestPath === "/api/enhance") {
+      requireCurrentUser(req);
       await enhancePrompt(req, res);
       return;
     }
-    if (req.method === "POST" && url.pathname === "/api/storyboard") {
+    if (req.method === "POST" && requestPath === "/api/storyboard") {
+      requireCurrentUser(req);
       await buildStoryboard(req, res);
       return;
     }
     if (req.method === "GET" || req.method === "HEAD") {
-      let path = decodeURIComponent(url.pathname);
+      let path = decodeURIComponent(requestPath);
       if (path === "/") path = "/index.html";
       const filePath = resolve(publicDir, `.${path}`);
       if (!filePath.startsWith(publicDir)) {
@@ -770,9 +1717,15 @@ async function route(req, res) {
       sendJson(res, 404, { error: "not found" });
       return;
     }
+    if (error instanceof HttpError || error?.status) {
+      sendJson(res, Number(error.status || 500), { error: error.message || "请求失败", code: error.code || "" });
+      return;
+    }
     sendJson(res, 500, { error: error?.message || String(error) });
   }
 }
+
+initializeStorage();
 
 const server = createServer(route);
 server.listen(defaultPort, () => {

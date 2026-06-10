@@ -7,7 +7,42 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div class="app-shell">
+  <section class="auth-gate" id="auth-gate">
+    <div class="auth-panel">
+      <div class="brand-row auth-brand">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div>
+          <div class="brand-title">图像创作台</div>
+          <div class="brand-subtitle">邮箱验证后进入工作区</div>
+        </div>
+      </div>
+      <div class="auth-tabs" role="tablist" aria-label="账号入口">
+        <button class="auth-tab active" id="auth-login-tab" data-auth-mode="login" type="button">登录</button>
+        <button class="auth-tab" id="auth-register-tab" data-auth-mode="register" type="button">注册</button>
+      </div>
+      <div class="auth-form">
+        <label>邮箱
+          <input id="auth-email" type="email" autocomplete="email" placeholder="name@example.com">
+        </label>
+        <div class="auth-register-fields" id="auth-register-fields">
+          <label>用户名
+            <input id="auth-username" type="text" autocomplete="username" placeholder="用于项目成员识别">
+          </label>
+          <label>显示名称
+            <input id="auth-display-name" type="text" autocomplete="name" placeholder="例如：创作团队">
+          </label>
+        </div>
+        <button class="primary-btn auth-wide-btn" id="auth-send-code-btn" type="button">发送验证码</button>
+        <label class="auth-code-row hidden" id="auth-code-row">验证码
+          <input id="auth-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6 位数字">
+        </label>
+        <button class="primary-btn auth-wide-btn auth-code-row hidden" id="auth-submit-btn" type="button">完成登录</button>
+        <div class="auth-status" id="auth-status">正在检查登录状态...</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="app-shell hidden" id="app-shell">
     <aside class="sidebar" id="sidebar">
       <div class="brand-row">
         <div class="brand-mark" aria-hidden="true"></div>
@@ -79,6 +114,10 @@
         </div>
         <div class="api-status" id="api-status">配置检查中</div>
         <button class="toolbar-btn" id="open-settings-btn" type="button" title="偏好设置">偏好</button>
+        <div class="account-chip" id="account-chip">
+          <span id="account-name">未登录</span>
+          <button id="logout-btn" type="button">退出</button>
+        </div>
       </header>
 
       <section class="chat-scroll" id="chat-scroll"></section>

@@ -29,6 +29,18 @@ VSLLM_IMAGE_MODEL=gpt-image-2-chat
 VSLLM_IMAGE_TOOL_MODEL=gpt-image-2
 VSLLM_ENHANCE_MODEL=deepseek-v4-pro
 PICSET_DATA_DIR=/opt/picset/data
+RESEND_API_KEY=...
+RESEND_FROM=PicSet <noreply@your-domain.com>
+PICSET_AUTH_SECRET=replace-with-a-long-random-secret
+PICSET_AUTH_REQUIRED=1
+PICSET_COOKIE_SECURE=1
+PICSET_BASE_PATH=/picset
+```
+
+`RESEND_FROM` must use a sender/domain that has been configured in Resend. After editing the env file, regenerate the secret value:
+
+```bash
+base64 -i .env | gh secret set PICSET_ENV_B64 --repo 1924605670/picset
 ```
 
 ## What The Workflow Does

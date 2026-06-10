@@ -30,6 +30,88 @@ button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .55; }
 
+.auth-gate {
+  min-height: var(--app-height);
+  display: grid;
+  place-items: center;
+  padding: 22px;
+  background:
+    linear-gradient(135deg, rgba(47,125,82,.10), transparent 46%),
+    linear-gradient(30deg, rgba(184,92,34,.10), transparent 40%),
+    var(--bg);
+}
+.auth-panel {
+  width: min(430px, 100%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.auth-brand {
+  min-height: 76px;
+  background: #fbfcfa;
+}
+.auth-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border-bottom: 1px solid var(--line);
+}
+.auth-tab {
+  min-height: 43px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: #fff;
+  color: var(--muted);
+  font-weight: 700;
+}
+.auth-tab:last-child { border-right: 0; }
+.auth-tab.active {
+  color: var(--green-dark);
+  background: #edf7ed;
+}
+.auth-form {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.auth-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.auth-form input {
+  width: 100%;
+  height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--text);
+  outline: none;
+  padding: 0 10px;
+  font-size: 14px;
+}
+.auth-register-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.auth-wide-btn {
+  width: 100%;
+  justify-content: center;
+}
+.auth-status {
+  min-height: 20px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.auth-status.error { color: var(--red); }
+.auth-status.ok { color: var(--green-dark); }
+
 .app-shell {
   height: var(--app-height);
   display: grid;
@@ -444,6 +526,32 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .toolbar-btn {
   height: 36px;
   padding: 0 12px;
+}
+.account-chip {
+  min-width: 0;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  padding: 0 8px 0 10px;
+}
+.account-chip span {
+  max-width: 150px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--muted);
+  font-size: 12px;
+}
+.account-chip button {
+  border: 0;
+  background: transparent;
+  color: var(--green-dark);
+  padding: 0;
+  font-size: 12px;
 }
 
 .chat-scroll {
@@ -1376,6 +1484,13 @@ button:disabled { cursor: not-allowed; opacity: .55; }
     height: 36px;
     padding: 0 10px;
   }
+  .account-chip {
+    padding: 0 8px;
+    gap: 6px;
+  }
+  .account-chip span {
+    max-width: 72px;
+  }
   .chat-scroll {
     padding: 14px 10px 16px;
     gap: 12px;
@@ -1468,5 +1583,11 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .asset-form,
   .picker-grid {
     padding: 12px;
+  }
+  .auth-gate {
+    padding: 12px;
+  }
+  .auth-register-fields {
+    grid-template-columns: 1fr;
   }
 }

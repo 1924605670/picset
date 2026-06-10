@@ -9,6 +9,17 @@ const stores = ["projects", "conversations", "messages", "gallery", "galleryFold
 const state = {
   db: null,
   config: null,
+  auth: {
+    user: null,
+    mode: "login",
+    emailSent: false,
+    pendingEmail: "",
+    cooldownUntil: 0,
+    cooldownTimer: null,
+    resendConfigured: false,
+    authRequired: true,
+    busy: "",
+  },
   settings: {
     apiBase: "",
     model: STANDARD_IMAGE_MODEL,
@@ -98,6 +109,250 @@ function toast(message) {
   toast._timer = setTimeout(() => el.classList.remove("show"), 2200);
 }
 
+function setAuthStatus(message, tone = "") {
+  const el = $("#auth-status");
+  if (!el) return;
+  el.textContent = message || "";
+  el.className = `auth-status ${tone || ""}`.trim();
+}
+
+function showAuthenticatedApp(show) {
+  $("#auth-gate")?.classList.toggle("hidden", show);
+  $("#app-shell")?.classList.toggle("hidden", !show);
+}
+
+function renderAccount() {
+  const user = state.auth.user;
+  const name = user?.displayName || user?.username || user?.email || "未登录";
+  const el = $("#account-name");
+  if (el) el.textContent = name;
+}
+
+function authEmail() {
+  return $("#auth-email")?.value.trim().toLowerCase() || "";
+}
+
+function renderAuthForm() {
+  const isRegister = state.auth.mode === "register";
+  $$(".auth-tab").forEach((btn) => btn.classList.toggle("active", btn.dataset.authMode === state.auth.mode));
+  $("#auth-register-fields")?.classList.toggle("hidden", !isRegister);
+  $$(".auth-code-row").forEach((el) => el.classList.toggle("hidden", !state.auth.emailSent));
+  const submit = $("#auth-submit-btn");
+  if (submit) submit.textContent = isRegister ? "完成注册" : "完成登录";
+  updateAuthSendButton();
+}
+
+function updateAuthSendButton() {
+  const btn = $("#auth-send-code-btn");
+  if (!btn) return;
+  const remaining = Math.max(0, Math.ceil((state.auth.cooldownUntil - Date.now()) / 1000));
+  const busy = Boolean(state.auth.busy);
+  btn.disabled = busy || remaining > 0;
+  if (state.auth.busy === "send") btn.textContent = "发送中";
+  else if (remaining > 0) btn.textContent = `${remaining} 秒后重发`;
+  else btn.textContent = "发送验证码";
+}
+
+function clearAuthCooldown() {
+  state.auth.cooldownUntil = 0;
+  clearInterval(state.auth.cooldownTimer);
+  state.auth.cooldownTimer = null;
+  updateAuthSendButton();
+}
+
+function startAuthCooldown(seconds = 60) {
+  state.auth.cooldownUntil = Date.now() + Number(seconds || 60) * 1000;
+  clearInterval(state.auth.cooldownTimer);
+  state.auth.cooldownTimer = setInterval(() => {
+    updateAuthSendButton();
+    if (Date.now() >= state.auth.cooldownUntil) {
+      clearInterval(state.auth.cooldownTimer);
+      state.auth.cooldownTimer = null;
+      updateAuthSendButton();
+    }
+  }, 500);
+  updateAuthSendButton();
+}
+
+function setAuthMode(mode) {
+  state.auth.mode = mode === "register" ? "register" : "login";
+  state.auth.emailSent = false;
+  state.auth.pendingEmail = "";
+  state.auth.busy = "";
+  clearAuthCooldown();
+  $("#auth-code").value = "";
+  setAuthStatus(state.auth.mode === "register" ? "输入邮箱并接收验证码创建账号。" : "输入已注册邮箱并接收登录验证码。");
+  renderAuthForm();
+}
+
+async function readApiJson(res, fallback = "请求失败") {
+  let data = {};
+  try { data = await res.json(); } catch {}
+  if (res.status === 401) {
+    handleAuthExpired(data.error || "登录状态已失效，请重新登录");
+  }
+  if (!res.ok) throw new Error(data.error || fallback);
+  return data;
+}
+
+async function authPost(path, payload) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return readApiJson(res, "认证请求失败");
+}
+
+async function sendAuthCode() {
+  const email = authEmail();
+  if (!email) {
+    setAuthStatus("请输入邮箱", "error");
+    return;
+  }
+  state.auth.busy = "send";
+  updateAuthSendButton();
+  setAuthStatus("正在发送验证码...");
+  try {
+    const path = state.auth.mode === "register" ? "api/auth/register/send-code" : "api/auth/login/send-code";
+    const data = await authPost(path, { email });
+    state.auth.emailSent = true;
+    state.auth.pendingEmail = email;
+    startAuthCooldown(data.cooldownSeconds || 60);
+    const devText = data.devCode ? `开发验证码：${data.devCode}` : "验证码已发送，请查看邮箱。";
+    setAuthStatus(devText, "ok");
+    renderAuthForm();
+    $("#auth-code")?.focus();
+  } catch (error) {
+    setAuthStatus(error.message || "验证码发送失败", "error");
+  } finally {
+    state.auth.busy = "";
+    updateAuthSendButton();
+  }
+}
+
+async function submitAuthCode() {
+  const email = authEmail();
+  const code = $("#auth-code")?.value.trim() || "";
+  if (!email || !/^\d{6}$/.test(code)) {
+    setAuthStatus("请输入邮箱和 6 位验证码", "error");
+    return;
+  }
+  state.auth.busy = "verify";
+  $("#auth-submit-btn").disabled = true;
+  setAuthStatus(state.auth.mode === "register" ? "正在创建账号..." : "正在登录...");
+  try {
+    const isRegister = state.auth.mode === "register";
+    const path = isRegister ? "api/auth/register/verify" : "api/auth/login/verify";
+    const payload = {
+      email,
+      code,
+      username: $("#auth-username")?.value.trim() || "",
+      displayName: $("#auth-display-name")?.value.trim() || "",
+    };
+    const data = await authPost(path, payload);
+    await completeAuth(data);
+  } catch (error) {
+    setAuthStatus(error.message || "验证码校验失败", "error");
+  } finally {
+    state.auth.busy = "";
+    $("#auth-submit-btn").disabled = false;
+    updateAuthSendButton();
+  }
+}
+
+function resetWorkspaceState() {
+  for (const controller of state.activeTasks.values()) controller.abort();
+  state.projects = [];
+  state.conversations = [];
+  state.messages = [];
+  state.gallery = [];
+  state.galleryFolders = [];
+  state.favorites = [];
+  state.assets = [];
+  state.pendingImages = [];
+  state.activeTasks.clear();
+  state.currentProjectId = DEFAULT_PROJECT_ID;
+  state.currentConversationId = null;
+  state.activeGalleryFolderId = "all";
+  localStorage.removeItem("picsetCurrentProjectId");
+  resetStoryboardStateOnly();
+}
+
+function handleAuthExpired(message = "登录状态已失效，请重新登录") {
+  state.auth.user = null;
+  resetWorkspaceState();
+  showAuthenticatedApp(false);
+  renderAccount();
+  setAuthStatus(message, "error");
+  renderAuthForm();
+}
+
+async function completeAuth(data) {
+  state.auth.user = data.user || null;
+  state.auth.emailSent = false;
+  state.auth.pendingEmail = "";
+  clearAuthCooldown();
+  $("#auth-code").value = "";
+  if (data.defaultProjectId) {
+    state.currentProjectId = data.defaultProjectId;
+    localStorage.setItem("picsetCurrentProjectId", state.currentProjectId);
+  }
+  showAuthenticatedApp(true);
+  renderAccount();
+  await loadWorkspaceAfterAuth();
+}
+
+async function initAuth() {
+  try {
+    const res = await fetch("api/auth/me");
+    const data = await readApiJson(res, "登录状态检查失败");
+    state.auth.user = data.user || null;
+    state.auth.resendConfigured = Boolean(data.resendConfigured);
+    state.auth.authRequired = data.authRequired !== false;
+    if (data.defaultProjectId) {
+      state.currentProjectId = data.defaultProjectId;
+      localStorage.setItem("picsetCurrentProjectId", state.currentProjectId);
+    }
+    if (data.authenticated && data.user) {
+      showAuthenticatedApp(true);
+      renderAccount();
+      return true;
+    }
+    showAuthenticatedApp(false);
+    setAuthMode("login");
+    const hint = data.resendConfigured || data.devAuthCode
+      ? "输入邮箱接收验证码后进入工作区。"
+      : "服务端还未配置 RESEND_API_KEY 和 RESEND_FROM。";
+    setAuthStatus(hint, data.resendConfigured || data.devAuthCode ? "" : "error");
+    return false;
+  } catch (error) {
+    showAuthenticatedApp(false);
+    setAuthStatus(error.message || "登录状态检查失败", "error");
+    renderAuthForm();
+    return false;
+  }
+}
+
+async function loadWorkspaceAfterAuth() {
+  await loadAll();
+  await initConfig();
+  renderAll();
+  updateParamSummary();
+}
+
+async function logoutCurrentUser() {
+  try {
+    await fetch("api/auth/logout", { method: "POST" });
+  } catch {}
+  state.auth.user = null;
+  resetWorkspaceState();
+  showAuthenticatedApp(false);
+  renderAccount();
+  setAuthMode("login");
+  setAuthStatus("已退出登录。");
+}
+
 function openLegacyDb() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -133,15 +388,13 @@ async function put(store, value) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(record),
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "保存失败");
+  const data = await readApiJson(res, "保存失败");
   return data.item;
 }
 
 async function del(store, id) {
   const res = await fetch(`api/data/${encodeURIComponent(store)}/${encodeURIComponent(id)}`, { method: "DELETE" });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "删除失败");
+  const data = await readApiJson(res, "删除失败");
   return data;
 }
 
@@ -150,16 +403,14 @@ async function getAll(store) {
     ? `api/data/${encodeURIComponent(store)}`
     : `api/data/${encodeURIComponent(store)}?projectId=${encodeURIComponent(state.currentProjectId)}`;
   const res = await fetch(url);
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "读取失败");
+  const data = await readApiJson(res, "读取失败");
   return data.items || [];
 }
 
 async function clearStore(store) {
   const projectParam = store === "projects" ? "" : `?projectId=${encodeURIComponent(state.currentProjectId)}`;
   const res = await fetch(`api/data/${encodeURIComponent(store)}${projectParam}`, { method: "DELETE" });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "清空失败");
+  const data = await readApiJson(res, "清空失败");
   return data;
 }
 
@@ -199,8 +450,7 @@ async function migrateLegacyIndexedDbIfNeeded(snapshot) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ projectId: state.currentProjectId || DEFAULT_PROJECT_ID, stores: legacyStores }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "旧数据迁移失败");
+    const data = await readApiJson(res, "旧数据迁移失败");
     localStorage.setItem("picsetSqliteMigrationDone", "1");
     toast(`已迁移 ${legacyCount} 条旧本地数据到 SQLite`);
     return data;
@@ -215,8 +465,7 @@ async function migrateLegacyIndexedDbIfNeeded(snapshot) {
 
 async function loadAll() {
   const res = await fetch(`api/data/bootstrap?projectId=${encodeURIComponent(state.currentProjectId || DEFAULT_PROJECT_ID)}`);
-  let snapshot = await res.json();
-  if (!res.ok) throw new Error(snapshot.error || "读取工作区失败");
+  let snapshot = await readApiJson(res, "读取工作区失败");
   snapshot = await migrateLegacyIndexedDbIfNeeded(snapshot);
   state.projects = (snapshot.projects || []).filter((item) => !item.archivedAt).sort((a, b) => b.updatedAt - a.updatedAt);
   if (!state.projects.some((project) => project.id === state.currentProjectId)) {
@@ -1023,6 +1272,7 @@ async function postSse(url, payload, signal, onEvent) {
   if (!res.ok || !ctype.includes("text/event-stream")) {
     let text = await res.text();
     try { text = JSON.parse(text).error || text; } catch {}
+    if (res.status === 401) handleAuthExpired(text || "登录状态已失效，请重新登录");
     throw new Error(text || `HTTP ${res.status}`);
   }
   const reader = res.body.getReader();
@@ -1237,8 +1487,7 @@ async function enhancePrompt() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt, apiBase: state.settings.apiBase || undefined }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "提示词增强失败");
+    const data = await readApiJson(res, "提示词增强失败");
     input.value = data.prompt;
     autoresizePrompt();
     toast("提示词已优化");
@@ -1319,8 +1568,7 @@ async function planStoryboard() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ story, count, style, continuity, anchors, apiBase: state.settings.apiBase || undefined }),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "剧情拆分失败");
+    const data = await readApiJson(res, "剧情拆分失败");
     state.storyboard = {
       title: data.title || "连续出图",
       anchors: mergeStoryboardAnchors(Array.isArray(data.anchors) ? data.anchors : [], previousAnchors),
@@ -1861,6 +2109,27 @@ async function saveAsset() {
 
 function bindEvents() {
   bindOptionChips();
+  $$("[data-auth-mode]").forEach((btn) => {
+    btn.onclick = () => setAuthMode(btn.dataset.authMode);
+  });
+  $("#auth-send-code-btn").onclick = sendAuthCode;
+  $("#auth-submit-btn").onclick = submitAuthCode;
+  $("#auth-email").addEventListener("input", () => {
+    if (state.auth.emailSent && authEmail() !== state.auth.pendingEmail) {
+      state.auth.emailSent = false;
+      $("#auth-code").value = "";
+      renderAuthForm();
+    }
+  });
+  $("#auth-email").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      if (state.auth.emailSent) submitAuthCode();
+      else sendAuthCode();
+    }
+  });
+  $("#auth-code").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") submitAuthCode();
+  });
   $("#project-select").onchange = (event) => switchProject(event.target.value);
   $("#manage-projects-btn").onclick = () => {
     $("#project-name-input").value = "";
@@ -1906,6 +2175,7 @@ function bindEvents() {
     applySettingsToModal();
     openModal("settings-modal");
   };
+  $("#logout-btn").onclick = logoutCurrentUser;
   $("#save-settings-btn").onclick = saveSettingsFromModal;
   $("#send-btn").onclick = sendMessage;
   $("#prompt-input").addEventListener("input", autoresizePrompt);
@@ -1995,7 +2265,7 @@ function bindEvents() {
 
 async function initConfig() {
   const res = await fetch("api/config");
-  state.config = await res.json();
+  state.config = await readApiJson(res, "配置读取失败");
   if (!state.settings.apiBase) state.settings.apiBase = "";
   enforceStandardModel();
   const status = $("#api-status");
@@ -2008,10 +2278,9 @@ async function init() {
   setAppViewportHeight();
   loadSettingsLocal();
   bindEvents();
-  await loadAll();
-  await initConfig();
-  renderAll();
-  updateParamSummary();
+  renderAuthForm();
+  const authenticated = await initAuth();
+  if (authenticated) await loadWorkspaceAfterAuth();
 }
 
 init().catch((error) => {
