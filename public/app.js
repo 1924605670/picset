@@ -124,7 +124,7 @@ function idbRequest(req) {
 
 async function put(store, value) {
   const record = withProject(store, value);
-  const res = await fetch(`/api/data/${encodeURIComponent(store)}`, {
+  const res = await fetch(`api/data/${encodeURIComponent(store)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(record),
@@ -135,7 +135,7 @@ async function put(store, value) {
 }
 
 async function del(store, id) {
-  const res = await fetch(`/api/data/${encodeURIComponent(store)}/${encodeURIComponent(id)}`, { method: "DELETE" });
+  const res = await fetch(`api/data/${encodeURIComponent(store)}/${encodeURIComponent(id)}`, { method: "DELETE" });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || "删除失败");
   return data;
@@ -143,8 +143,8 @@ async function del(store, id) {
 
 async function getAll(store) {
   const url = store === "projects"
-    ? `/api/data/${encodeURIComponent(store)}`
-    : `/api/data/${encodeURIComponent(store)}?projectId=${encodeURIComponent(state.currentProjectId)}`;
+    ? `api/data/${encodeURIComponent(store)}`
+    : `api/data/${encodeURIComponent(store)}?projectId=${encodeURIComponent(state.currentProjectId)}`;
   const res = await fetch(url);
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || "读取失败");
@@ -153,7 +153,7 @@ async function getAll(store) {
 
 async function clearStore(store) {
   const projectParam = store === "projects" ? "" : `?projectId=${encodeURIComponent(state.currentProjectId)}`;
-  const res = await fetch(`/api/data/${encodeURIComponent(store)}${projectParam}`, { method: "DELETE" });
+  const res = await fetch(`api/data/${encodeURIComponent(store)}${projectParam}`, { method: "DELETE" });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || "清空失败");
   return data;
@@ -190,7 +190,7 @@ async function migrateLegacyIndexedDbIfNeeded(snapshot) {
       localStorage.setItem("picsetSqliteMigrationDone", "1");
       return snapshot;
     }
-    const res = await fetch("/api/data/bootstrap", {
+    const res = await fetch("api/data/bootstrap", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ projectId: state.currentProjectId || DEFAULT_PROJECT_ID, stores: legacyStores }),
@@ -210,7 +210,7 @@ async function migrateLegacyIndexedDbIfNeeded(snapshot) {
 }
 
 async function loadAll() {
-  const res = await fetch(`/api/data/bootstrap?projectId=${encodeURIComponent(state.currentProjectId || DEFAULT_PROJECT_ID)}`);
+  const res = await fetch(`api/data/bootstrap?projectId=${encodeURIComponent(state.currentProjectId || DEFAULT_PROJECT_ID)}`);
   let snapshot = await res.json();
   if (!res.ok) throw new Error(snapshot.error || "读取工作区失败");
   snapshot = await migrateLegacyIndexedDbIfNeeded(snapshot);
@@ -916,7 +916,7 @@ async function runGeneration(msgId) {
     await updateMessage(msgId, msg);
 
     try {
-      const result = await postSse("/api/generate", {
+      const result = await postSse("api/generate", {
         prompt: msg.requestPrompt || msg.sourcePrompt || msg.text || "",
         images: msg.images || [],
         size: msg.params?.size || "auto",
@@ -1218,7 +1218,7 @@ async function enhancePrompt() {
   $("#enhance-btn").disabled = true;
   $("#enhance-btn").textContent = "优化中";
   try {
-    const res = await fetch("/api/enhance", {
+    const res = await fetch("api/enhance", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt, apiBase: state.settings.apiBase || undefined }),
@@ -1300,7 +1300,7 @@ async function planStoryboard() {
   $("#storyboard-plan-btn").textContent = "规划中";
   $("#storyboard-status").textContent = "正在规划角色、关键对象、核心主题和分镜...";
   try {
-    const res = await fetch("/api/storyboard", {
+    const res = await fetch("api/storyboard", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ story, count, style, continuity, anchors, apiBase: state.settings.apiBase || undefined }),
@@ -1978,7 +1978,7 @@ function bindEvents() {
 }
 
 async function initConfig() {
-  const res = await fetch("/api/config");
+  const res = await fetch("api/config");
   state.config = await res.json();
   if (!state.settings.apiBase) state.settings.apiBase = "";
   if (!localStorage.getItem("imageWorkbenchSettings") && !localStorage.getItem("vsllmCloneSettings")) {
