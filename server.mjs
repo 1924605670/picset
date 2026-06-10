@@ -18,6 +18,9 @@ const DEFAULT_TOOL_MODEL = "gpt-image-2";
 const DEFAULT_ENHANCE_MODEL = "deepseek-v4-pro";
 const DEFAULT_PROJECT_ID = "project_default";
 const DATA_STORES = new Set(["projects", "conversations", "messages", "gallery", "galleryFolders", "favorites", "assets"]);
+const IMAGE_MODEL_OPTIONS = [
+  { id: DEFAULT_IMAGE_MODEL, name: "标准生成", desc: "默认通道 · 适合日常草稿", premium: false },
+];
 
 mkdirSync(dataDir, { recursive: true });
 const db = new DatabaseSync(dbFile);
@@ -165,7 +168,7 @@ function getRuntimeConfig(overrides = {}) {
   const config = loadConfig();
   const apiKey = overrides.apiKey || pick(config, ["VSLLM_API_KEY", "OPENAI_API_KEY", "HF_IMAGE_API_KEY", "key"]);
   const baseUrl = normalizeApiBaseUrl(overrides.apiBase || pick(config, ["VSLLM_API_BASE_URL", "OPENAI_BASE_URL", "HF_IMAGE_API_BASE_URL", "url"], DEFAULT_API_BASE));
-  const imageModel = overrides.model || pick(config, ["VSLLM_IMAGE_MODEL", "model", "model1"], DEFAULT_IMAGE_MODEL);
+  const imageModel = DEFAULT_IMAGE_MODEL;
   const toolModel = overrides.toolModel || pick(config, ["VSLLM_IMAGE_TOOL_MODEL"], DEFAULT_TOOL_MODEL);
   const enhanceModel = overrides.enhanceModel || pick(config, ["VSLLM_ENHANCE_MODEL"], DEFAULT_ENHANCE_MODEL);
   return { apiKey, baseUrl, imageModel, toolModel, enhanceModel };
@@ -732,10 +735,7 @@ async function route(req, res) {
         defaultModel: DEFAULT_IMAGE_MODEL,
         toolModel: cfg.toolModel,
         enhanceModel: cfg.enhanceModel,
-        models: [
-          { id: "gpt-image-2-chat", name: "标准生成", desc: "默认通道 · 适合日常草稿", premium: false },
-          { id: "gpt-image-2-chat-priority", name: "高速生成", desc: "加速通道 · 更快更稳 · 成本更高", premium: true },
-        ],
+        models: IMAGE_MODEL_OPTIONS,
       });
       return;
     }

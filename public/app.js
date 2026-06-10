@@ -4,13 +4,14 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const DB_NAME = "ImageCreationWorkbench";
 const DB_VERSION = 2;
 const DEFAULT_PROJECT_ID = "project_default";
+const STANDARD_IMAGE_MODEL = "gpt-image-2-chat";
 const stores = ["projects", "conversations", "messages", "gallery", "galleryFolders", "favorites", "assets"];
 const state = {
   db: null,
   config: null,
   settings: {
     apiBase: "",
-    model: "gpt-image-2-chat",
+    model: STANDARD_IMAGE_MODEL,
     timeoutMs: 0,
     retries: 1,
   },
@@ -41,9 +42,12 @@ const examples = [
 ];
 
 const MODEL_LABELS = {
-  "gpt-image-2-chat-priority": { name: "高速生成", desc: "加速通道 · 更快更稳 · 成本更高" },
-  "gpt-image-2-chat": { name: "标准生成", desc: "经济通道 · 适合日常草稿" },
+  [STANDARD_IMAGE_MODEL]: { name: "标准生成", desc: "默认通道 · 适合日常草稿" },
 };
+
+const MODEL_OPTIONS = [
+  { id: STANDARD_IMAGE_MODEL, name: "标准生成", desc: "默认通道 · 适合日常草稿", premium: false },
+];
 
 const ANCHOR_TYPES = [
   { id: "character", name: "角色" },
@@ -711,10 +715,8 @@ function renderPendingImages() {
 }
 
 function renderModelMenu() {
-  const models = state.config?.models || [
-    { id: "gpt-image-2-chat", name: "标准生成", desc: "默认通道 · 适合日常草稿", premium: false },
-    { id: "gpt-image-2-chat-priority", name: "高速生成", desc: "加速通道 · 更快更稳", premium: true },
-  ];
+  enforceStandardModel();
+  const models = allowedImageModels();
   $("#current-model").textContent = modelLabel(state.settings.model).name;
   const menu = $("#model-menu");
   menu.innerHTML = "";
@@ -725,7 +727,7 @@ function renderModelMenu() {
     const label = modelLabel(model.id, model);
     btn.innerHTML = `<strong>${escapeHtml(label.name)}</strong><span>${escapeHtml(label.desc)}</span>`;
     btn.onclick = () => {
-      state.settings.model = model.id;
+      state.settings.model = STANDARD_IMAGE_MODEL;
       saveSettingsLocal();
       renderModelMenu();
       menu.classList.add("hidden");
@@ -741,7 +743,18 @@ function modelLabel(id, fallback = {}) {
   };
 }
 
+function allowedImageModels() {
+  const configured = Array.isArray(state.config?.models) ? state.config.models : [];
+  const standard = configured.find((model) => model.id === STANDARD_IMAGE_MODEL);
+  return [standard || MODEL_OPTIONS[0]];
+}
+
+function enforceStandardModel() {
+  state.settings.model = STANDARD_IMAGE_MODEL;
+}
+
 function saveSettingsLocal() {
+  enforceStandardModel();
   localStorage.setItem("imageWorkbenchSettings", JSON.stringify(state.settings));
 }
 
@@ -749,6 +762,7 @@ function loadSettingsLocal() {
   try {
     const saved = JSON.parse(localStorage.getItem("imageWorkbenchSettings") || localStorage.getItem("vsllmCloneSettings") || "{}");
     Object.assign(state.settings, saved);
+    enforceStandardModel();
   } catch {}
 }
 
@@ -924,7 +938,7 @@ async function runGeneration(msgId) {
         format: msg.params?.format || "png",
         reasoning: msg.params?.reasoning || "off",
         seed: msg.seed || 0,
-        model: state.settings.model,
+        model: STANDARD_IMAGE_MODEL,
         apiBase: state.settings.apiBase || undefined,
       }, controller.signal, (event, data) => {
         if (event === "log") {
@@ -1790,12 +1804,13 @@ function closeModal(id) {
 }
 
 function applySettingsToModal() {
+  enforceStandardModel();
   $("#setting-api-base").value = state.settings.apiBase || "";
   $("#setting-timeout").value = String(state.settings.timeoutMs || 0);
   $("#setting-retries").value = String(state.settings.retries || 0);
   const select = $("#setting-model");
   select.innerHTML = "";
-  const models = state.config?.models || [];
+  const models = allowedImageModels();
   for (const model of models) {
     const opt = document.createElement("option");
     opt.value = model.id;
@@ -1804,15 +1819,16 @@ function applySettingsToModal() {
     opt.title = label.desc;
     select.appendChild(opt);
   }
-  select.value = state.settings.model;
+  select.value = STANDARD_IMAGE_MODEL;
+  select.disabled = true;
   $("#settings-note").textContent = state.config?.hasKey
-    ? "后端已从本地环境读取密钥；接口配置可用。"
+    ? "后端已从本地环境读取密钥；当前仅开放标准生成通道。"
     : "后端没有读取到密钥。请在项目 .env、工作区 .env 或技能配置文件中补齐访问凭据。";
 }
 
 function saveSettingsFromModal() {
   state.settings.apiBase = $("#setting-api-base").value.trim();
-  state.settings.model = $("#setting-model").value || state.settings.model;
+  state.settings.model = STANDARD_IMAGE_MODEL;
   state.settings.timeoutMs = Number($("#setting-timeout").value || 0);
   state.settings.retries = Number($("#setting-retries").value || 0);
   saveSettingsLocal();
@@ -1981,9 +1997,7 @@ async function initConfig() {
   const res = await fetch("api/config");
   state.config = await res.json();
   if (!state.settings.apiBase) state.settings.apiBase = "";
-  if (!localStorage.getItem("imageWorkbenchSettings") && !localStorage.getItem("vsllmCloneSettings")) {
-    state.settings.model = state.config.defaultModel || state.config.imageModel || state.settings.model;
-  }
+  enforceStandardModel();
   const status = $("#api-status");
   status.textContent = state.config.hasKey ? "配置可用" : "缺少密钥";
   status.className = `api-status ${state.config.hasKey ? "ok" : "bad"}`;
