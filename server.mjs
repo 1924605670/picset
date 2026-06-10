@@ -1,18 +1,118 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 const rootDir = resolve(import.meta.dirname);
 const publicDir = join(rootDir, "public");
 const workspaceDir = resolve(rootDir, "..");
 const skillEnvFile = "/Users/chengzhihua/.codex/skills/vsllm-image/.env";
 const defaultPort = Number(process.env.PORT || 4173);
+const dataDir = resolve(process.env.PICSET_DATA_DIR || join(rootDir, "data"));
+const dbFile = resolve(process.env.PICSET_DB_FILE || join(dataDir, "picset.sqlite"));
 
 const DEFAULT_API_BASE = "https://vsllm.com/v1";
 const DEFAULT_IMAGE_MODEL = "gpt-image-2-chat";
 const DEFAULT_TOOL_MODEL = "gpt-image-2";
 const DEFAULT_ENHANCE_MODEL = "deepseek-v4-pro";
+const DEFAULT_PROJECT_ID = "project_default";
+const DATA_STORES = new Set(["projects", "conversations", "messages", "gallery", "galleryFolders", "favorites", "assets"]);
+
+mkdirSync(dataDir, { recursive: true });
+const db = new DatabaseSync(dbFile);
+db.exec(`
+  PRAGMA journal_mode = WAL;
+  PRAGMA foreign_keys = ON;
+  CREATE TABLE IF NOT EXISTS records (
+    store TEXT NOT NULL,
+    id TEXT NOT NULL,
+    project_id TEXT,
+    json TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (store, id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_records_store_project ON records(store, project_id);
+  CREATE INDEX IF NOT EXISTS idx_records_updated ON records(store, updated_at);
+`);
+
+function parseRecord(row) {
+  try {
+    return JSON.parse(row.json);
+  } catch {
+    return null;
+  }
+}
+
+function getRecord(store, id) {
+  const row = db.prepare("SELECT json FROM records WHERE store = ? AND id = ?").get(store, id);
+  return row ? parseRecord(row) : null;
+}
+
+function putRecord(store, record) {
+  if (!DATA_STORES.has(store)) throw new Error(`unsupported store: ${store}`);
+  if (!record || typeof record !== "object") throw new Error("record must be an object");
+  const id = String(record.id || "").trim();
+  if (!id) throw new Error("record.id is required");
+  const createdAt = Number(record.createdAt || Date.now());
+  const updatedAt = Number(record.updatedAt || record.createdAt || Date.now());
+  const projectId = store === "projects" ? id : String(record.projectId || DEFAULT_PROJECT_ID);
+  const next = store === "projects" ? { ...record, id, createdAt, updatedAt } : { ...record, id, projectId, createdAt, updatedAt };
+  db.prepare(`
+    INSERT INTO records (store, id, project_id, json, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(store, id) DO UPDATE SET
+      project_id = excluded.project_id,
+      json = excluded.json,
+      created_at = excluded.created_at,
+      updated_at = excluded.updated_at
+  `).run(store, id, projectId, JSON.stringify(next), createdAt, updatedAt);
+  return next;
+}
+
+function ensureDefaultProject() {
+  if (getRecord("projects", DEFAULT_PROJECT_ID)) return;
+  const ts = Date.now();
+  putRecord("projects", {
+    id: DEFAULT_PROJECT_ID,
+    name: "默认项目",
+    description: "迁移和新建内容的默认工作区",
+    createdAt: ts,
+    updatedAt: ts,
+  });
+}
+
+function listRecords(store, projectId = "") {
+  if (!DATA_STORES.has(store)) throw new Error(`unsupported store: ${store}`);
+  const rows = store === "projects" || !projectId
+    ? db.prepare("SELECT json FROM records WHERE store = ? ORDER BY updated_at DESC, created_at DESC").all(store)
+    : db.prepare("SELECT json FROM records WHERE store = ? AND project_id = ? ORDER BY updated_at DESC, created_at DESC").all(store, projectId);
+  return rows.map(parseRecord).filter(Boolean);
+}
+
+function deleteRecord(store, id) {
+  if (!DATA_STORES.has(store)) throw new Error(`unsupported store: ${store}`);
+  db.prepare("DELETE FROM records WHERE store = ? AND id = ?").run(store, id);
+}
+
+function clearRecords(store, projectId = "") {
+  if (!DATA_STORES.has(store)) throw new Error(`unsupported store: ${store}`);
+  if (store === "projects") throw new Error("projects cannot be cleared");
+  if (projectId) db.prepare("DELETE FROM records WHERE store = ? AND project_id = ?").run(store, projectId);
+  else db.prepare("DELETE FROM records WHERE store = ?").run(store);
+}
+
+function bootstrapData(projectId = DEFAULT_PROJECT_ID) {
+  ensureDefaultProject();
+  const data = { projects: listRecords("projects") };
+  for (const store of DATA_STORES) {
+    if (store === "projects") continue;
+    data[store] = listRecords(store, projectId);
+  }
+  data.defaultProjectId = projectId;
+  return data;
+}
 
 function parseEnvFile(path) {
   if (!existsSync(path)) return {};
@@ -577,6 +677,52 @@ async function buildStoryboard(req, res) {
 async function route(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
+    if (req.method === "GET" && url.pathname === "/api/data/bootstrap") {
+      sendJson(res, 200, bootstrapData(url.searchParams.get("projectId") || DEFAULT_PROJECT_ID));
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/data/bootstrap") {
+      const input = await readJson(req);
+      const projectId = input.projectId || DEFAULT_PROJECT_ID;
+      const stores = input.stores && typeof input.stores === "object" ? input.stores : {};
+      ensureDefaultProject();
+      for (const store of DATA_STORES) {
+        const records = Array.isArray(stores[store]) ? stores[store] : [];
+        for (const record of records) {
+          putRecord(store, store === "projects" ? record : { ...record, projectId: record.projectId || projectId });
+        }
+      }
+      sendJson(res, 200, bootstrapData(projectId));
+      return;
+    }
+    const dataStoreMatch = url.pathname.match(/^\/api\/data\/([^/]+)(?:\/([^/]+))?$/);
+    if (dataStoreMatch) {
+      const store = dataStoreMatch[1];
+      const id = dataStoreMatch[2] ? decodeURIComponent(dataStoreMatch[2]) : "";
+      if (!DATA_STORES.has(store)) {
+        sendJson(res, 404, { error: "unknown data store" });
+        return;
+      }
+      if (req.method === "GET") {
+        sendJson(res, 200, { items: listRecords(store, url.searchParams.get("projectId") || "") });
+        return;
+      }
+      if (req.method === "POST") {
+        const record = await readJson(req);
+        sendJson(res, 200, { item: putRecord(store, record) });
+        return;
+      }
+      if (req.method === "DELETE" && id) {
+        deleteRecord(store, id);
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      if (req.method === "DELETE") {
+        clearRecords(store, url.searchParams.get("projectId") || "");
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+    }
     if (req.method === "GET" && url.pathname === "/api/config") {
       const cfg = getRuntimeConfig();
       sendJson(res, 200, {

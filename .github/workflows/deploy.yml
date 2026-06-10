@@ -28,7 +28,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Run syntax checks
         run: npm run check
@@ -63,6 +63,7 @@ jobs:
             --exclude='.github' \
             --exclude='.env' \
             --exclude='.env.*' \
+            --exclude='data' \
             --exclude='node_modules' \
             --exclude='npm-debug.log*' \
             --exclude='yarn-debug.log*' \

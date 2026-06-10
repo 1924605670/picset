@@ -17,6 +17,14 @@
         </div>
       </div>
 
+      <section class="side-section project-section">
+        <div class="side-head">
+          <span>当前项目</span>
+          <button class="ghost-mini" id="manage-projects-btn" type="button">管理</button>
+        </div>
+        <select class="project-select" id="project-select" aria-label="选择项目"></select>
+      </section>
+
       <section class="side-section">
         <div class="side-head">
           <span>创作记录</span>
@@ -189,6 +197,28 @@
       <div class="modal-actions">
         <button class="secondary-btn" data-close="settings-modal" type="button">取消</button>
         <button class="primary-btn" id="save-settings-btn" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop hidden" id="projects-modal">
+    <div class="modal-panel">
+      <div class="modal-head">
+        <h2>项目管理</h2>
+        <button class="close-btn" data-close="projects-modal" type="button">×</button>
+      </div>
+      <div class="project-form">
+        <label class="full-label">项目名称
+          <input id="project-name-input" type="text" placeholder="例如：猫狗搞笑短剧">
+        </label>
+        <label class="full-label">项目说明
+          <textarea id="project-desc-input" rows="3" placeholder="记录用途、风格或客户要求"></textarea>
+        </label>
+      </div>
+      <div class="project-list" id="project-list"></div>
+      <div class="modal-actions">
+        <button class="secondary-btn" data-close="projects-modal" type="button">关闭</button>
+        <button class="primary-btn" id="save-project-btn" type="button">新建项目</button>
       </div>
     </div>
   </div>

@@ -3,7 +3,8 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 const DB_NAME = "ImageCreationWorkbench";
 const DB_VERSION = 2;
-const stores = ["conversations", "messages", "gallery", "galleryFolders", "favorites", "assets"];
+const DEFAULT_PROJECT_ID = "project_default";
+const stores = ["projects", "conversations", "messages", "gallery", "galleryFolders", "favorites", "assets"];
 const state = {
   db: null,
   config: null,
@@ -13,6 +14,8 @@ const state = {
     timeoutMs: 0,
     retries: 1,
   },
+  projects: [],
+  currentProjectId: localStorage.getItem("picsetCurrentProjectId") || DEFAULT_PROJECT_ID,
   conversations: [],
   messages: [],
   gallery: [],
@@ -91,7 +94,7 @@ function toast(message) {
   toast._timer = setTimeout(() => el.classList.remove("show"), 2200);
 }
 
-function openDb() {
+function openLegacyDb() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
@@ -108,8 +111,8 @@ function openDb() {
   });
 }
 
-function txStore(name, mode = "readonly") {
-  return state.db.transaction(name, mode).objectStore(name);
+function legacyTxStore(db, name, mode = "readonly") {
+  return db.transaction(name, mode).objectStore(name);
 }
 
 function idbRequest(req) {
@@ -120,40 +123,121 @@ function idbRequest(req) {
 }
 
 async function put(store, value) {
-  return idbRequest(txStore(store, "readwrite").put(value));
+  const record = withProject(store, value);
+  const res = await fetch(`/api/data/${encodeURIComponent(store)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(record),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "保存失败");
+  return data.item;
 }
 
 async function del(store, id) {
-  return idbRequest(txStore(store, "readwrite").delete(id));
+  const res = await fetch(`/api/data/${encodeURIComponent(store)}/${encodeURIComponent(id)}`, { method: "DELETE" });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "删除失败");
+  return data;
 }
 
 async function getAll(store) {
-  return idbRequest(txStore(store).getAll());
+  const url = store === "projects"
+    ? `/api/data/${encodeURIComponent(store)}`
+    : `/api/data/${encodeURIComponent(store)}?projectId=${encodeURIComponent(state.currentProjectId)}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "读取失败");
+  return data.items || [];
 }
 
 async function clearStore(store) {
-  return idbRequest(txStore(store, "readwrite").clear());
+  const projectParam = store === "projects" ? "" : `?projectId=${encodeURIComponent(state.currentProjectId)}`;
+  const res = await fetch(`/api/data/${encodeURIComponent(store)}${projectParam}`, { method: "DELETE" });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "清空失败");
+  return data;
+}
+
+function withProject(store, value) {
+  if (store === "projects") return value;
+  return { ...value, projectId: value.projectId || state.currentProjectId || DEFAULT_PROJECT_ID };
+}
+
+async function legacyGetAll(db, store) {
+  if (!db.objectStoreNames.contains(store)) return [];
+  return idbRequest(legacyTxStore(db, store).getAll());
+}
+
+async function migrateLegacyIndexedDbIfNeeded(snapshot) {
+  if (localStorage.getItem("picsetSqliteMigrationDone") === "1") return snapshot;
+  const hasServerData = ["conversations", "messages", "gallery", "galleryFolders", "favorites", "assets"]
+    .some((store) => (snapshot[store] || []).length > 0);
+  if (hasServerData) {
+    localStorage.setItem("picsetSqliteMigrationDone", "1");
+    return snapshot;
+  }
+  let legacyDb = null;
+  try {
+    legacyDb = await openLegacyDb();
+    const legacyStores = {};
+    let legacyCount = 0;
+    for (const store of ["conversations", "messages", "gallery", "galleryFolders", "favorites", "assets"]) {
+      legacyStores[store] = (await legacyGetAll(legacyDb, store)).map((item) => withProject(store, item));
+      legacyCount += legacyStores[store].length;
+    }
+    if (!legacyCount) {
+      localStorage.setItem("picsetSqliteMigrationDone", "1");
+      return snapshot;
+    }
+    const res = await fetch("/api/data/bootstrap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: state.currentProjectId || DEFAULT_PROJECT_ID, stores: legacyStores }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "旧数据迁移失败");
+    localStorage.setItem("picsetSqliteMigrationDone", "1");
+    toast(`已迁移 ${legacyCount} 条旧本地数据到 SQLite`);
+    return data;
+  } catch (error) {
+    console.warn(error);
+    toast(error.message || "旧数据迁移失败");
+    return snapshot;
+  } finally {
+    legacyDb?.close?.();
+  }
 }
 
 async function loadAll() {
-  state.conversations = (await getAll("conversations")).sort((a, b) => b.updatedAt - a.updatedAt);
-  state.messages = (await getAll("messages")).sort((a, b) => a.createdAt - b.createdAt);
-  state.gallery = (await getAll("gallery")).sort((a, b) => b.createdAt - a.createdAt);
-  state.galleryFolders = (await getAll("galleryFolders")).sort((a, b) => a.createdAt - b.createdAt);
-  state.favorites = (await getAll("favorites")).sort((a, b) => b.createdAt - a.createdAt);
-  state.assets = (await getAll("assets")).sort((a, b) => b.createdAt - a.createdAt);
+  const res = await fetch(`/api/data/bootstrap?projectId=${encodeURIComponent(state.currentProjectId || DEFAULT_PROJECT_ID)}`);
+  let snapshot = await res.json();
+  if (!res.ok) throw new Error(snapshot.error || "读取工作区失败");
+  snapshot = await migrateLegacyIndexedDbIfNeeded(snapshot);
+  state.projects = (snapshot.projects || []).filter((item) => !item.archivedAt).sort((a, b) => b.updatedAt - a.updatedAt);
+  if (!state.projects.some((project) => project.id === state.currentProjectId)) {
+    state.currentProjectId = state.projects[0]?.id || snapshot.defaultProjectId || DEFAULT_PROJECT_ID;
+    localStorage.setItem("picsetCurrentProjectId", state.currentProjectId);
+    if (state.currentProjectId !== snapshot.defaultProjectId) return loadAll();
+  }
+  state.conversations = (snapshot.conversations || []).sort((a, b) => b.updatedAt - a.updatedAt);
+  state.messages = (snapshot.messages || []).sort((a, b) => a.createdAt - b.createdAt);
+  state.gallery = (snapshot.gallery || []).sort((a, b) => b.createdAt - a.createdAt);
+  state.galleryFolders = (snapshot.galleryFolders || []).sort((a, b) => a.createdAt - b.createdAt);
+  state.favorites = (snapshot.favorites || []).sort((a, b) => b.createdAt - a.createdAt);
+  state.assets = (snapshot.assets || []).sort((a, b) => b.createdAt - a.createdAt);
   if (!state.conversations.length) await createConversation();
   else state.currentConversationId = state.conversations[0].id;
 }
 
 async function createConversation(title = "新创作") {
-  const conv = { id: uid("conv"), title, createdAt: now(), updatedAt: now() };
-  await put("conversations", conv);
-  state.conversations.unshift(conv);
-  state.currentConversationId = conv.id;
+  const conv = { id: uid("conv"), projectId: state.currentProjectId, title, createdAt: now(), updatedAt: now() };
+  const saved = await put("conversations", conv);
+  state.conversations.unshift(saved);
+  state.currentConversationId = saved.id;
   state.pendingImages = [];
   renderAll();
-  return conv;
+  return saved;
 }
 
 async function updateConversation(convId, patch) {
@@ -166,11 +250,11 @@ async function updateConversation(convId, patch) {
 }
 
 async function addMessage(message) {
-  const record = { ...message, id: message.id || uid("msg"), createdAt: message.createdAt || now() };
-  state.messages.push(record);
-  await put("messages", record);
-  await updateConversation(record.conversationId, {});
-  return record;
+  const record = { ...message, projectId: message.projectId || state.currentProjectId, id: message.id || uid("msg"), createdAt: message.createdAt || now() };
+  const saved = await put("messages", record);
+  state.messages.push(saved);
+  await updateConversation(saved.conversationId, {});
+  return saved;
 }
 
 async function updateMessage(id, patch) {
@@ -200,6 +284,7 @@ function getSeed() {
 }
 
 function renderAll() {
+  renderProjects();
   renderConversationList();
   renderChat();
   renderFolderList();
@@ -208,6 +293,99 @@ function renderAll() {
   renderAssets();
   renderPendingImages();
   renderModelMenu();
+}
+
+function currentProject() {
+  return state.projects.find((project) => project.id === state.currentProjectId) || state.projects[0] || null;
+}
+
+function renderProjects() {
+  const select = $("#project-select");
+  if (!select) return;
+  select.innerHTML = "";
+  for (const project of state.projects) {
+    const option = document.createElement("option");
+    option.value = project.id;
+    option.textContent = project.name || "未命名项目";
+    select.appendChild(option);
+  }
+  select.value = state.currentProjectId;
+  renderProjectList();
+}
+
+function renderProjectList() {
+  const list = $("#project-list");
+  if (!list) return;
+  list.innerHTML = "";
+  for (const project of state.projects) {
+    const row = document.createElement("div");
+    row.className = `project-row ${project.id === state.currentProjectId ? "active" : ""}`;
+    row.innerHTML = `
+      <div>
+        <strong>${escapeHtml(project.name || "未命名项目")}</strong>
+        <span>${escapeHtml(project.description || "暂无说明")}</span>
+      </div>
+      <div class="project-row-actions">
+        <button class="ghost-mini" data-switch-project="${project.id}" type="button">切换</button>
+        <button class="ghost-mini" data-rename-project="${project.id}" type="button">载入</button>
+      </div>
+    `;
+    $("[data-switch-project]", row).onclick = () => switchProject(project.id);
+    $("[data-rename-project]", row).onclick = () => loadProjectIntoForm(project.id);
+    list.appendChild(row);
+  }
+}
+
+function loadProjectIntoForm(projectId) {
+  const project = state.projects.find((item) => item.id === projectId);
+  if (!project) return;
+  $("#project-name-input").value = project.name || "";
+  $("#project-desc-input").value = project.description || "";
+  $("#save-project-btn").dataset.editProjectId = project.id;
+  $("#save-project-btn").textContent = "保存项目";
+}
+
+async function saveProjectFromModal() {
+  const name = $("#project-name-input").value.trim();
+  const description = $("#project-desc-input").value.trim();
+  if (!name) {
+    toast("请输入项目名称");
+    return;
+  }
+  const editingId = $("#save-project-btn").dataset.editProjectId;
+  const existing = editingId ? state.projects.find((item) => item.id === editingId) : null;
+  const ts = now();
+  const project = {
+    id: existing?.id || uid("project"),
+    name,
+    description,
+    createdAt: existing?.createdAt || ts,
+    updatedAt: ts,
+  };
+  const saved = await put("projects", project);
+  const idx = state.projects.findIndex((item) => item.id === saved.id);
+  if (idx >= 0) state.projects[idx] = saved;
+  else state.projects.unshift(saved);
+  state.projects.sort((a, b) => b.updatedAt - a.updatedAt);
+  $("#project-name-input").value = "";
+  $("#project-desc-input").value = "";
+  delete $("#save-project-btn").dataset.editProjectId;
+  $("#save-project-btn").textContent = "新建项目";
+  if (!existing) await switchProject(saved.id);
+  else renderProjects();
+}
+
+async function switchProject(projectId) {
+  if (!projectId || projectId === state.currentProjectId) return;
+  state.currentProjectId = projectId;
+  localStorage.setItem("picsetCurrentProjectId", projectId);
+  state.currentConversationId = null;
+  state.pendingImages = [];
+  state.activeGalleryFolderId = "all";
+  resetStoryboardStateOnly();
+  await loadAll();
+  renderAll();
+  setSidebarOpen(false);
 }
 
 function renderConversationList() {
@@ -428,11 +606,11 @@ async function createGalleryFolder(name) {
   const clean = String(name || "").trim() || "新文件夹";
   const existing = state.galleryFolders.find((folder) => folder.name === clean);
   if (existing) return existing;
-  const folder = { id: uid("folder"), name: clean, createdAt: now(), updatedAt: now() };
-  state.galleryFolders.push(folder);
-  await put("galleryFolders", folder);
+  const folder = { id: uid("folder"), projectId: state.currentProjectId, name: clean, createdAt: now(), updatedAt: now() };
+  const saved = await put("galleryFolders", folder);
+  state.galleryFolders.push(saved);
   renderFolderList();
-  return folder;
+  return saved;
 }
 
 function galleryFolderName(folderId) {
@@ -872,10 +1050,10 @@ function estimateDataUrlBytes(dataUrl) {
 }
 
 async function addGallery(image, prompt, params, folderId = null) {
-  const item = { id: uid("gal"), image, prompt, params, folderId: folderId || null, createdAt: now() };
-  state.gallery.unshift(item);
-  await put("gallery", item);
-  return item;
+  const item = { id: uid("gal"), projectId: state.currentProjectId, image, prompt, params, folderId: folderId || null, createdAt: now(), updatedAt: now() };
+  const saved = await put("gallery", item);
+  state.gallery.unshift(saved);
+  return saved;
 }
 
 function activeOutputFolderId() {
@@ -953,9 +1131,9 @@ async function addFavorite(prompt) {
     toast("提示词已收藏");
     return;
   }
-  const fav = { id: uid("fav"), prompt: text, createdAt: now() };
-  state.favorites.unshift(fav);
-  await put("favorites", fav);
+  const fav = { id: uid("fav"), projectId: state.currentProjectId, prompt: text, createdAt: now(), updatedAt: now() };
+  const saved = await put("favorites", fav);
+  state.favorites.unshift(saved);
   renderFavorites();
   toast("已收藏提示词");
 }
@@ -1088,8 +1266,12 @@ function usePickedGallery() {
   closeModal("gallery-picker-modal");
 }
 
-function resetStoryboard() {
+function resetStoryboardStateOnly() {
   state.storyboard = { title: "", anchors: [], frames: [], run: null, busy: "" };
+}
+
+function resetStoryboard() {
+  resetStoryboardStateOnly();
   $("#storyboard-story").value = "";
   $("#storyboard-count").value = "6";
   $("#storyboard-style").value = "电影感，写实摄影，统一色调";
@@ -1653,9 +1835,9 @@ async function saveAsset() {
     toast("名称和描述都需要填写");
     return;
   }
-  const asset = { id: uid("asset"), name, desc, type, createdAt: now() };
-  state.assets.unshift(asset);
-  await put("assets", asset);
+  const asset = { id: uid("asset"), projectId: state.currentProjectId, name, desc, type, createdAt: now(), updatedAt: now() };
+  const saved = await put("assets", asset);
+  state.assets.unshift(saved);
   $("#asset-name").value = "";
   $("#asset-desc").value = "";
   renderAssets();
@@ -1663,6 +1845,16 @@ async function saveAsset() {
 
 function bindEvents() {
   bindOptionChips();
+  $("#project-select").onchange = (event) => switchProject(event.target.value);
+  $("#manage-projects-btn").onclick = () => {
+    $("#project-name-input").value = "";
+    $("#project-desc-input").value = "";
+    delete $("#save-project-btn").dataset.editProjectId;
+    $("#save-project-btn").textContent = "新建项目";
+    renderProjectList();
+    openModal("projects-modal");
+  };
+  $("#save-project-btn").onclick = saveProjectFromModal;
   $("#new-conversation-btn").onclick = () => createConversation();
   $("#new-folder-btn").onclick = () => {
     $("#folder-name-input").value = "";
@@ -1761,7 +1953,7 @@ function bindEvents() {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
-      for (const id of ["settings-modal", "gallery-picker-modal", "folder-picker-modal", "folder-create-modal", "storyboard-modal", "edit-modal", "mark-modal", "assets-modal"]) closeModal(id);
+      for (const id of ["settings-modal", "projects-modal", "gallery-picker-modal", "folder-picker-modal", "folder-create-modal", "storyboard-modal", "edit-modal", "mark-modal", "assets-modal"]) closeModal(id);
       setSidebarOpen(false);
       for (const [msgId, controller] of state.activeTasks) {
         const msg = state.messages.find((item) => item.id === msgId);
@@ -1802,7 +1994,6 @@ async function init() {
   setAppViewportHeight();
   loadSettingsLocal();
   bindEvents();
-  state.db = await openDb();
   await loadAll();
   await initConfig();
   renderAll();

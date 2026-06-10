@@ -27,14 +27,18 @@ sudo_run() {
   printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
 }
 
-install_node_if_missing() {
+install_node_if_needed() {
+  local current_major="0"
   if command -v node >/dev/null 2>&1; then
+    current_major="$(node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || printf '0')"
+  fi
+  if [ "$current_major" -ge 24 ]; then
     return
   fi
 
   sudo_run apt-get update
   sudo_run apt-get install -y ca-certificates curl gnupg
-  curl -fsSL https://deb.nodesource.com/setup_20.x -o /tmp/nodesource_setup.sh
+  curl -fsSL https://deb.nodesource.com/setup_24.x -o /tmp/nodesource_setup.sh
   sudo_run bash /tmp/nodesource_setup.sh
   sudo_run apt-get install -y nodejs
 }
@@ -97,6 +101,7 @@ deploy_release() {
     --exclude='.git' \
     --exclude='.env' \
     --exclude='.env.*' \
+    --exclude='data' \
     --exclude='node_modules' \
     "$RELEASE_DIR"/ "$DEPLOY_DIR"/
   sudo_run chown -R "$RUN_USER:$RUN_USER" "$DEPLOY_DIR"
@@ -115,7 +120,7 @@ open_local_firewall_if_active() {
   fi
 }
 
-install_node_if_missing
+install_node_if_needed
 install_system_packages
 write_env_file_if_present
 deploy_release

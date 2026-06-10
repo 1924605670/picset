@@ -108,6 +108,50 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   gap: 6px;
 }
 
+.project-section { flex: 0 0 auto; }
+.project-select {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--text);
+  padding: 7px 9px;
+  outline: none;
+}
+.project-form { padding-top: 12px; }
+.project-list {
+  padding: 2px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 260px;
+  overflow: auto;
+}
+.project-row {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+.project-row.active {
+  border-color: #a6c9ad;
+  background: #edf5ed;
+}
+.project-row strong { display: block; font-size: 14px; }
+.project-row span {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+.project-row-actions { display: inline-flex; gap: 6px; }
+
 .icon-text-btn, .ghost-mini, .toolbar-btn, .tool-chip, .seg-btn, .seed-option, .secondary-btn, .primary-btn, .send-btn, .model-button, .mark-tool {
   border: 1px solid var(--line);
   background: #fff;
