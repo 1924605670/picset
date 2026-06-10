@@ -16,6 +16,7 @@ env:
   APP_NAME: picset
   APP_PORT: "4173"
   DEPLOY_DIR: /opt/picset
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   check:
