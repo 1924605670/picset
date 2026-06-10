@@ -48,12 +48,17 @@ jobs:
           TENCENT_USER: ${{ secrets.TENCENT_USER }}
           TENCENT_PASSWORD: ${{ secrets.TENCENT_PASSWORD }}
         run: |
-          if [ -n "$TENCENT_HOST" ] && [ -n "$TENCENT_USER" ] && [ -n "$TENCENT_PASSWORD" ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::Deployment secrets are incomplete; skipping deployment."
-            echo "ready=false" >> "$GITHUB_OUTPUT"
+          missing=0
+          for name in TENCENT_HOST TENCENT_USER TENCENT_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is required for deployment. Configure it in repository secrets."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
           fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Build release archive
         if: steps.deployment_secrets.outputs.ready == 'true'
