@@ -36,6 +36,10 @@ const DATA_STORES = new Set(["projects", "conversations", "messages", "gallery",
 const IMAGE_MODEL_OPTIONS = [
   { id: DEFAULT_IMAGE_MODEL, name: "标准生成", desc: "默认通道 · 适合日常草稿", premium: false },
 ];
+const ENHANCE_MODEL_OPTIONS = [
+  { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", desc: "当前默认 · 适合中文提示词优化和剧情拆帧" },
+  { id: "MiniMax-M3", name: "MiniMax-M3", desc: "备选 LLM · 适合长文本规划和中文创作" },
+];
 
 mkdirSync(dataDir, { recursive: true });
 mkdirSync(generatedDir, { recursive: true });
@@ -1370,13 +1374,18 @@ function buildApiUrl(baseUrl, path) {
   return `${normalizeApiBaseUrl(baseUrl)}/${String(path || "").replace(/^\/+/, "")}`;
 }
 
+function normalizeEnhanceModel(model) {
+  const value = String(model || "").trim();
+  return ENHANCE_MODEL_OPTIONS.some((item) => item.id === value) ? value : DEFAULT_ENHANCE_MODEL;
+}
+
 function getRuntimeConfig(overrides = {}) {
   const config = loadConfig();
   const apiKey = overrides.apiKey || pick(config, ["VSLLM_API_KEY", "OPENAI_API_KEY", "HF_IMAGE_API_KEY", "key"]);
   const baseUrl = normalizeApiBaseUrl(overrides.apiBase || pick(config, ["VSLLM_API_BASE_URL", "OPENAI_BASE_URL", "HF_IMAGE_API_BASE_URL", "url"], DEFAULT_API_BASE));
   const imageModel = DEFAULT_IMAGE_MODEL;
   const toolModel = overrides.toolModel || pick(config, ["VSLLM_IMAGE_TOOL_MODEL"], DEFAULT_TOOL_MODEL);
-  const enhanceModel = overrides.enhanceModel || pick(config, ["VSLLM_ENHANCE_MODEL"], DEFAULT_ENHANCE_MODEL);
+  const enhanceModel = normalizeEnhanceModel(overrides.enhanceModel || pick(config, ["VSLLM_ENHANCE_MODEL"], DEFAULT_ENHANCE_MODEL));
   return { apiKey, baseUrl, imageModel, toolModel, enhanceModel };
 }
 
@@ -2304,6 +2313,22 @@ async function proxyGenerate(req, res, user) {
   }
 }
 
+function chatContentText(content) {
+  if (Array.isArray(content)) return content.map((item) => typeof item === "string" ? item : item.text || "").join("");
+  return String(content || "");
+}
+
+function cleanModelResponseText(text) {
+  return String(text || "")
+    .trim()
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .trim()
+    .replace(/^```[a-zA-Z]*\n?/, "")
+    .replace(/\n?```$/, "")
+    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, "")
+    .trim();
+}
+
 async function enhancePrompt(req, res) {
   const input = await readJson(req);
   const cfg = getRuntimeConfig(input || {});
@@ -2316,6 +2341,7 @@ async function enhancePrompt(req, res) {
     "把用户想法改写成一段清晰、生动、可直接用于生成图片的中文自然语言提示词。",
     "必须使用简体中文输出，即使用户输入是英文或中英混合；但要保留用户指定的主体、意图、数字、@name 标记、专有名词和明确不可翻译的名称。",
     "补充有用的具体细节：场景、构图、光线、材质、镜头角度、情绪、色彩、纹理和关键道具。",
+    "不要输出 <think> 标签、推理过程、分析过程或英文说明。",
     "只输出优化后的提示词正文，不要 Markdown，不要引号，不要解释。",
   ].join("\n");
   try {
@@ -2346,9 +2372,7 @@ async function enhancePrompt(req, res) {
       return;
     }
     const data = JSON.parse(raw);
-    let text = data?.choices?.[0]?.message?.content;
-    if (Array.isArray(text)) text = text.map((item) => typeof item === "string" ? item : item.text || "").join("");
-    text = String(text || "").trim().replace(/^```[a-zA-Z]*\n?/, "").replace(/\n?```$/, "").replace(/^["'“”‘’]+|["'“”‘’]+$/g, "").trim();
+    const text = cleanModelResponseText(chatContentText(data?.choices?.[0]?.message?.content));
     sendJson(res, 200, { prompt: text, model: cfg.enhanceModel });
   } catch (error) {
     sendJson(res, 500, { error: error?.message || String(error) });
@@ -2356,7 +2380,7 @@ async function enhancePrompt(req, res) {
 }
 
 function parseStoryboardJson(text) {
-  const raw = String(text || "").trim().replace(/^```(?:json)?\n?/i, "").replace(/\n?```$/i, "").trim();
+  const raw = cleanModelResponseText(text);
   try {
     return JSON.parse(raw);
   } catch {}
@@ -2446,6 +2470,7 @@ async function buildStoryboard(req, res) {
     "Continuity anchors are recurring characters, key objects, important locations, or visual themes that must stay consistent across every generated image.",
     "Each frame must follow the previous frame logically and preserve the anchors exactly: character appearance, clothing, props, setting details, color palette, and lighting direction.",
     "Write prompts as natural-language image descriptions, not comma-separated tag lists.",
+    "Do not output <think> tags, reasoning, analysis, or any text outside the JSON object.",
     "Return strict JSON only. No markdown.",
     'Schema: {"title":"短标题","anchors":[{"type":"character|object|location|theme","name":"名称","description":"固定设定","visualLock":"每张图必须遵守的视觉锁定描述"}],"frames":[{"title":"短标题","beat":"剧情节点","prompt":"适合图像生成的自然语言画面描述"}]}',
   ].join("\n");
@@ -2493,8 +2518,7 @@ async function buildStoryboard(req, res) {
       return;
     }
     const data = JSON.parse(raw);
-    let content = data?.choices?.[0]?.message?.content;
-    if (Array.isArray(content)) content = content.map((item) => typeof item === "string" ? item : item.text || "").join("");
+    const content = chatContentText(data?.choices?.[0]?.message?.content);
     const parsed = parseStoryboardJson(content);
     const frames = normalizeStoryboard(parsed, count);
     const anchors = normalizeStoryboardAnchors(parsed, { story, style, continuity });
@@ -2551,6 +2575,7 @@ async function route(req, res) {
         toolModel: cfg.toolModel,
         enhanceModel: cfg.enhanceModel,
         models: IMAGE_MODEL_OPTIONS,
+        enhanceModels: ENHANCE_MODEL_OPTIONS,
       });
       return;
     }

@@ -5,6 +5,7 @@ const DB_NAME = "ImageCreationWorkbench";
 const DB_VERSION = 2;
 const DEFAULT_PROJECT_ID = "project_default";
 const STANDARD_IMAGE_MODEL = "gpt-image-2-chat";
+const DEFAULT_ENHANCE_MODEL = "deepseek-v4-pro";
 const stores = ["projects", "conversations", "messages", "gallery", "galleryFolders", "favorites", "assets"];
 const state = {
   db: null,
@@ -23,6 +24,7 @@ const state = {
   settings: {
     apiBase: "",
     model: STANDARD_IMAGE_MODEL,
+    enhanceModel: DEFAULT_ENHANCE_MODEL,
     timeoutMs: 0,
     retries: 1,
   },
@@ -65,6 +67,16 @@ const MODEL_LABELS = {
 
 const MODEL_OPTIONS = [
   { id: STANDARD_IMAGE_MODEL, name: "标准生成", desc: "默认通道 · 适合日常草稿", premium: false },
+];
+
+const ENHANCE_MODEL_LABELS = {
+  "deepseek-v4-pro": { name: "DeepSeek V4 Pro", desc: "当前默认 · 适合中文提示词优化和剧情拆帧" },
+  "MiniMax-M3": { name: "MiniMax-M3", desc: "备选 LLM · 适合长文本规划和中文创作" },
+};
+
+const ENHANCE_MODEL_OPTIONS = [
+  { id: "deepseek-v4-pro", ...ENHANCE_MODEL_LABELS["deepseek-v4-pro"] },
+  { id: "MiniMax-M3", ...ENHANCE_MODEL_LABELS["MiniMax-M3"] },
 ];
 
 const ANCHOR_TYPES = [
@@ -1040,8 +1052,38 @@ function enforceStandardModel() {
   state.settings.model = STANDARD_IMAGE_MODEL;
 }
 
+function enhanceModelLabel(id, fallback = {}) {
+  return {
+    name: fallback.name || ENHANCE_MODEL_LABELS[id]?.name || id || "默认 LLM",
+    desc: fallback.desc || ENHANCE_MODEL_LABELS[id]?.desc || "用于提示词优化和连续出图规划",
+  };
+}
+
+function allowedEnhanceModels() {
+  const configured = Array.isArray(state.config?.enhanceModels) && state.config.enhanceModels.length ? state.config.enhanceModels : ENHANCE_MODEL_OPTIONS;
+  const byId = new Map();
+  for (const model of [...ENHANCE_MODEL_OPTIONS, ...configured]) {
+    if (!model?.id) continue;
+    byId.set(model.id, { ...enhanceModelLabel(model.id, model), id: model.id });
+  }
+  return Array.from(byId.values());
+}
+
+function normalizeEnhanceModelSetting() {
+  const models = allowedEnhanceModels();
+  const ids = new Set(models.map((model) => model.id));
+  if (ids.has(state.settings.enhanceModel)) return;
+  state.settings.enhanceModel = ids.has(state.config?.enhanceModel) ? state.config.enhanceModel : (models[0]?.id || DEFAULT_ENHANCE_MODEL);
+}
+
+function selectedEnhanceModel() {
+  normalizeEnhanceModelSetting();
+  return state.settings.enhanceModel || DEFAULT_ENHANCE_MODEL;
+}
+
 function saveSettingsLocal() {
   enforceStandardModel();
+  normalizeEnhanceModelSetting();
   localStorage.setItem("imageWorkbenchSettings", JSON.stringify(state.settings));
 }
 
@@ -1050,6 +1092,7 @@ function loadSettingsLocal() {
     const saved = JSON.parse(localStorage.getItem("imageWorkbenchSettings") || localStorage.getItem("vsllmCloneSettings") || "{}");
     Object.assign(state.settings, saved);
     enforceStandardModel();
+    normalizeEnhanceModelSetting();
   } catch {}
 }
 
@@ -1663,7 +1706,7 @@ async function enhancePrompt() {
     const res = await fetch("api/enhance", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, apiBase: state.settings.apiBase || undefined }),
+      body: JSON.stringify({ prompt, apiBase: state.settings.apiBase || undefined, enhanceModel: selectedEnhanceModel() }),
     });
     const data = await readApiJson(res, "提示词增强失败");
     input.value = data.prompt;
@@ -1944,7 +1987,7 @@ async function planStoryboard() {
     const res = await fetch("api/storyboard", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ story, count, style, continuity, anchors, apiBase: state.settings.apiBase || undefined }),
+      body: JSON.stringify({ story, count, style, continuity, anchors, apiBase: state.settings.apiBase || undefined, enhanceModel: selectedEnhanceModel() }),
     });
     const data = await readApiJson(res, "剧情拆分失败");
     state.storyboard = {
@@ -2447,14 +2490,28 @@ function applySettingsToModal() {
   }
   select.value = STANDARD_IMAGE_MODEL;
   select.disabled = true;
+  const enhanceSelect = $("#setting-enhance-model");
+  enhanceSelect.innerHTML = "";
+  normalizeEnhanceModelSetting();
+  for (const model of allowedEnhanceModels()) {
+    const opt = document.createElement("option");
+    opt.value = model.id;
+    const label = enhanceModelLabel(model.id, model);
+    opt.textContent = label.name;
+    opt.title = label.desc;
+    enhanceSelect.appendChild(opt);
+  }
+  enhanceSelect.value = selectedEnhanceModel();
+  enhanceSelect.disabled = false;
   $("#settings-note").textContent = state.config?.hasKey
-    ? "后端已从本地环境读取密钥；当前仅开放标准生成通道。"
+    ? "后端已从本地环境读取密钥；生成通道仅开放标准生成，LLM 优化模型可选择。"
     : "后端没有读取到密钥。请在项目 .env、工作区 .env 或技能配置文件中补齐访问凭据。";
 }
 
 function saveSettingsFromModal() {
   state.settings.apiBase = $("#setting-api-base").value.trim();
   state.settings.model = STANDARD_IMAGE_MODEL;
+  state.settings.enhanceModel = $("#setting-enhance-model").value || DEFAULT_ENHANCE_MODEL;
   state.settings.timeoutMs = Number($("#setting-timeout").value || 0);
   state.settings.retries = Number($("#setting-retries").value || 0);
   saveSettingsLocal();
@@ -2464,7 +2521,7 @@ function saveSettingsFromModal() {
 }
 
 function updateParamSummary() {
-  $("#params-label").textContent = `${$("#param-size").value} · ${$("#param-quality").value} · ${$("#param-format").value}`;
+  $("#params-label").textContent = `${$("#param-size").value} · ${$("#param-quality").value} · ${$("#param-format").value} · LLM ${enhanceModelLabel(selectedEnhanceModel()).name}`;
   const seed = getSeed();
   $("#seed-label").textContent = seed ? String(seed) : "无";
 }
@@ -2650,6 +2707,7 @@ async function initConfig() {
   state.config = await readApiJson(res, "配置读取失败");
   if (!state.settings.apiBase) state.settings.apiBase = "";
   enforceStandardModel();
+  normalizeEnhanceModelSetting();
   const status = $("#api-status");
   status.textContent = state.config.hasKey ? "配置可用" : "缺少密钥";
   status.className = `api-status ${state.config.hasKey ? "ok" : "bad"}`;
