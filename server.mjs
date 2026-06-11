@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { createHash, randomBytes, randomInt, scryptSync } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
@@ -12,6 +12,7 @@ const skillEnvFile = "/Users/chengzhihua/.codex/skills/vsllm-image/.env";
 const defaultPort = Number(process.env.PORT || 4173);
 const dataDir = resolve(process.env.PICSET_DATA_DIR || join(rootDir, "data"));
 const dbFile = resolve(process.env.PICSET_DB_FILE || join(dataDir, "picset.sqlite"));
+const generatedDir = resolve(process.env.PICSET_GENERATED_DIR || join(dataDir, "generated"));
 
 const DEFAULT_API_BASE = "https://vsllm.com/v1";
 const DEFAULT_IMAGE_MODEL = "gpt-image-2-chat";
@@ -37,7 +38,9 @@ const IMAGE_MODEL_OPTIONS = [
 ];
 
 mkdirSync(dataDir, { recursive: true });
+mkdirSync(generatedDir, { recursive: true });
 const db = new DatabaseSync(dbFile);
+const generationWorkers = new Map();
 
 class HttpError extends Error {
   constructor(status, message, code = "") {
@@ -294,10 +297,13 @@ function initializeStorage() {
 
   addColumnIfMissing("records", "owner_id", "TEXT");
   addColumnIfMissing("records", "deleted_at", "INTEGER NOT NULL DEFAULT 0");
+  addColumnIfMissing("generation_tasks", "usage_event_id", "TEXT");
+  addColumnIfMissing("generation_tasks", "cancel_requested", "INTEGER NOT NULL DEFAULT 0");
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_records_store_project ON records(store, project_id, deleted_at);
     CREATE INDEX IF NOT EXISTS idx_records_owner_store ON records(owner_id, store, deleted_at);
     CREATE INDEX IF NOT EXISTS idx_records_updated ON records(store, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_generation_tasks_owner ON generation_tasks(owner_id, status, updated_at);
   `);
   seedDefaultAdmin();
   ensureQuotasForExistingUsers();
@@ -502,19 +508,21 @@ function refundGenerationCredit(reservation, error = "") {
   if (!reservation || reservation.settled) return quotaSummaryForUser(reservation?.userId || "");
   reservation.settled = true;
   const ts = nowMs();
-  db.prepare(`
-    UPDATE user_quotas
-    SET quota_used = CASE WHEN quota_used > 0 THEN quota_used - 1 ELSE 0 END,
-      updated_at = ?
-    WHERE user_id = ?
-  `).run(ts, reservation.userId);
-  db.prepare(`
+  const usage = db.prepare(`
     UPDATE usage_events
     SET status = 'refunded',
       error = ?,
       updated_at = ?
     WHERE id = ? AND status = 'reserved'
   `).run(String(error || "").slice(0, 1200), ts, reservation.id);
+  if (usage?.changes) {
+    db.prepare(`
+      UPDATE user_quotas
+      SET quota_used = CASE WHEN quota_used > 0 THEN quota_used - 1 ELSE 0 END,
+        updated_at = ?
+      WHERE user_id = ?
+    `).run(ts, reservation.userId);
+  }
   return quotaSummaryForUser(reservation.userId);
 }
 
@@ -1627,6 +1635,521 @@ function parseSseEvent(raw) {
   }
 }
 
+function safeJsonParse(value, fallback = {}) {
+  if (!value) return fallback;
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(String(value));
+  } catch {
+    return fallback;
+  }
+}
+
+function taskLogLine(label) {
+  return `${new Date().toLocaleTimeString("zh-CN", { hour12: false })} ${label}`;
+}
+
+function imageMimeForFormat(format = "png") {
+  const normalized = String(format || "png").toLowerCase();
+  if (normalized === "jpg" || normalized === "jpeg") return "image/jpeg";
+  if (normalized === "webp") return "image/webp";
+  return "image/png";
+}
+
+function imageExtensionForFormat(format = "png") {
+  const normalized = String(format || "png").toLowerCase();
+  if (normalized === "jpg" || normalized === "jpeg") return "jpg";
+  if (normalized === "webp") return "webp";
+  return "png";
+}
+
+function imageFormatFromMime(mime = "") {
+  const normalized = String(mime || "").toLowerCase();
+  if (normalized.includes("jpeg") || normalized.includes("jpg")) return "jpeg";
+  if (normalized.includes("webp")) return "webp";
+  if (normalized.includes("png")) return "png";
+  return "";
+}
+
+function normalizeImageForClient(image, format = "png") {
+  const raw = String(image || "");
+  if (!raw) return "";
+  if (/^(data:|https?:\/\/|blob:|\/|api\/)/i.test(raw)) return raw;
+  return `data:${imageMimeForFormat(format)};base64,${raw.replace(/\s+/g, "")}`;
+}
+
+function generationTaskById(taskId) {
+  return db.prepare(`
+    SELECT
+      id,
+      project_id AS projectId,
+      owner_id AS ownerId,
+      type,
+      status,
+      progress,
+      input_json AS inputJson,
+      output_json AS outputJson,
+      error,
+      created_at AS createdAt,
+      updated_at AS updatedAt,
+      started_at AS startedAt,
+      finished_at AS finishedAt,
+      usage_event_id AS usageEventId,
+      cancel_requested AS cancelRequested
+    FROM generation_tasks
+    WHERE id = ?
+  `).get(taskId) || null;
+}
+
+function assertGenerationTaskAccess(user, task) {
+  if (!task) throw new HttpError(404, "生成任务不存在", "task_not_found");
+  if (task.ownerId === user.id || canAccessProject(user, task.projectId)) return;
+  throw new HttpError(403, "没有这个生成任务的访问权限", "task_forbidden");
+}
+
+function publicGenerationTask(row) {
+  if (!row) return null;
+  const input = safeJsonParse(row.inputJson, {});
+  const output = safeJsonParse(row.outputJson, {});
+  const safeInput = { ...input };
+  delete safeInput.apiKey;
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    ownerId: row.ownerId,
+    type: row.type,
+    status: row.status,
+    progress: Number(row.progress || 0),
+    input: safeInput,
+    output,
+    logs: Array.isArray(output.logs) ? output.logs : [],
+    error: row.error || "",
+    cancelRequested: Boolean(row.cancelRequested),
+    createdAt: Number(row.createdAt || 0),
+    updatedAt: Number(row.updatedAt || 0),
+    startedAt: Number(row.startedAt || 0),
+    finishedAt: Number(row.finishedAt || 0),
+  };
+}
+
+function isTerminalGenerationStatus(status) {
+  return ["succeeded", "failed", "cancelled"].includes(String(status || ""));
+}
+
+function updateGenerationTask(taskId, patch = {}) {
+  const columns = {
+    status: "status",
+    progress: "progress",
+    inputJson: "input_json",
+    outputJson: "output_json",
+    error: "error",
+    startedAt: "started_at",
+    finishedAt: "finished_at",
+    usageEventId: "usage_event_id",
+    cancelRequested: "cancel_requested",
+    updatedAt: "updated_at",
+  };
+  const assignments = [];
+  const values = [];
+  const next = { ...patch };
+  if (!Object.prototype.hasOwnProperty.call(next, "updatedAt")) next.updatedAt = nowMs();
+  for (const [key, value] of Object.entries(next)) {
+    const column = columns[key];
+    if (!column) continue;
+    assignments.push(`${column} = ?`);
+    values.push(value);
+  }
+  if (!assignments.length) return;
+  db.prepare(`UPDATE generation_tasks SET ${assignments.join(", ")} WHERE id = ?`).run(...values, taskId);
+}
+
+function appendGenerationTaskLog(output, label) {
+  if (!label) return output;
+  const logs = Array.isArray(output.logs) ? output.logs : [];
+  return { ...output, logs: [...logs, taskLogLine(label)].slice(-50) };
+}
+
+function updateGenerationTaskOutput(taskId, mutate, patch = {}) {
+  const row = generationTaskById(taskId);
+  if (!row) return null;
+  const current = safeJsonParse(row.outputJson, {});
+  const next = typeof mutate === "function" ? mutate({ ...current }) : { ...current, ...(mutate || {}) };
+  updateGenerationTask(taskId, { ...patch, outputJson: JSON.stringify(next || {}) });
+  return next;
+}
+
+function taskCancelRequested(taskId) {
+  const row = generationTaskById(taskId);
+  return !row || row.status === "cancelled" || Number(row.cancelRequested || 0) === 1;
+}
+
+function makeAbortError(message = "生成任务已取消") {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+function generationTaskReservation(row) {
+  const output = safeJsonParse(row?.outputJson, {});
+  return {
+    id: row?.usageEventId || output.usageEventId || "",
+    userId: row?.ownerId || "",
+    settled: false,
+    quota: output.quota || quotaSummaryForUser(row?.ownerId || ""),
+  };
+}
+
+function setGenerationTaskProgress(taskId, progress, label = "", extra = {}) {
+  const row = generationTaskById(taskId);
+  if (!row || isTerminalGenerationStatus(row.status) || Number(row.cancelRequested || 0) === 1) return false;
+  updateGenerationTaskOutput(taskId, (output) => appendGenerationTaskLog({ ...output, ...extra, label }, label), {
+    status: "running",
+    progress: Math.max(0, Math.min(99, Math.floor(Number(progress || 0)))),
+  });
+  return true;
+}
+
+async function saveGeneratedImage(taskId, image, format = "png") {
+  const raw = String(image || "");
+  if (!raw) throw new Error("图片数据为空");
+  if (/^https?:\/\//i.test(raw)) {
+    return { image: raw, imageUrl: raw, bytes: 0, format, external: true };
+  }
+
+  let mime = imageMimeForFormat(format);
+  let base64 = raw;
+  const match = raw.match(/^data:([^;]+);base64,(.*)$/is);
+  if (match) {
+    mime = match[1].toLowerCase();
+    base64 = match[2];
+  }
+  const buffer = Buffer.from(base64.replace(/\s+/g, ""), "base64");
+  if (!buffer.length) throw new Error("图片数据为空");
+
+  const normalizedFormat = imageFormatFromMime(mime) || format || "png";
+  const ext = imageExtensionForFormat(normalizedFormat);
+  const date = new Date();
+  const year = String(date.getFullYear());
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const dir = join(generatedDir, year, month);
+  mkdirSync(dir, { recursive: true });
+  const fileName = `${taskId}.${ext}`;
+  const filePath = join(dir, fileName);
+  await writeFile(filePath, buffer);
+  const imageUrl = `api/generated/${year}/${month}/${fileName}`;
+  return {
+    image: imageUrl,
+    imageUrl,
+    bytes: buffer.length,
+    format: normalizedFormat,
+    mimeType: mime,
+    path: `${year}/${month}/${fileName}`,
+  };
+}
+
+async function completeGenerationTask(taskId, row, image, usage, format, startedAt) {
+  if (taskCancelRequested(taskId)) throw makeAbortError();
+  const saved = await saveGeneratedImage(taskId, image, format);
+  if (taskCancelRequested(taskId)) throw makeAbortError();
+  const elapsedMs = Date.now() - startedAt;
+  const reservation = generationTaskReservation(row);
+  const quota = commitGenerationCredit(reservation, {
+    usage,
+    elapsedMs,
+    format: saved.format || format,
+    imageUrl: saved.imageUrl,
+    bytes: saved.bytes,
+    taskId,
+  });
+  updateGenerationTaskOutput(taskId, (output) => appendGenerationTaskLog({
+    ...output,
+    ...saved,
+    usage: usage || null,
+    elapsedMs,
+    quota,
+    partial: "",
+  }, "生成完成，图片已保存"), {
+    status: "succeeded",
+    progress: 100,
+    error: null,
+    finishedAt: nowMs(),
+  });
+}
+
+function cancelGenerationTaskRecord(taskId, reason = "用户取消了生成任务") {
+  const row = generationTaskById(taskId);
+  if (!row) return null;
+  if (isTerminalGenerationStatus(row.status)) return publicGenerationTask(row);
+  const reservation = generationTaskReservation(row);
+  const quota = refundGenerationCredit(reservation, reason);
+  updateGenerationTaskOutput(taskId, (output) => appendGenerationTaskLog({ ...output, quota, error: reason }, reason), {
+    status: "cancelled",
+    progress: Math.max(0, Number(row.progress || 0)),
+    error: reason,
+    cancelRequested: 1,
+    finishedAt: nowMs(),
+  });
+  return publicGenerationTask(generationTaskById(taskId));
+}
+
+function failGenerationTaskRecord(taskId, reason = "生成任务失败") {
+  const row = generationTaskById(taskId);
+  if (!row) return null;
+  if (isTerminalGenerationStatus(row.status)) return publicGenerationTask(row);
+  const reservation = generationTaskReservation(row);
+  const quota = refundGenerationCredit(reservation, reason);
+  updateGenerationTaskOutput(taskId, (output) => appendGenerationTaskLog({ ...output, quota, error: reason }, reason), {
+    status: "failed",
+    progress: Math.max(0, Number(row.progress || 0)),
+    error: reason,
+    finishedAt: nowMs(),
+  });
+  return publicGenerationTask(generationTaskById(taskId));
+}
+
+async function runGenerationTask(taskId) {
+  if (generationWorkers.has(taskId)) return;
+  let row = generationTaskById(taskId);
+  if (!row || isTerminalGenerationStatus(row.status)) return;
+
+  const input = safeJsonParse(row.inputJson, {});
+  const { cfg, payload, format } = buildImagePayload(input);
+  const controller = new AbortController();
+  generationWorkers.set(taskId, { controller });
+
+  const startedAt = Date.now();
+  let keepaliveTimer = null;
+  let latestImage = null;
+  let latestUsage = null;
+  let finalResponse = null;
+  let failedMessage = "";
+  let eventCount = 0;
+  const partialPreviewLimit = 1_600_000;
+
+  try {
+    if (Number(row.cancelRequested || 0) === 1) throw makeAbortError();
+    if (!cfg.apiKey) throw new Error("missing API key in env");
+    updateGenerationTask(taskId, { status: "running", progress: 10, startedAt: nowMs(), error: null });
+    setGenerationTaskProgress(taskId, 12, "后台任务开始请求上游接口", {
+      model: payload.model,
+      toolModel: payload.tools[0].model,
+      size: payload.tools[0].size || "auto",
+      quality: payload.tools[0].quality,
+      format,
+    });
+
+    const upstream = await fetch(buildApiUrl(cfg.baseUrl, "responses"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${cfg.apiKey}`,
+        "Accept": payload.stream ? "text/event-stream" : "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    if (!upstream.ok) {
+      const raw = await upstream.text();
+      let message = raw.slice(0, 1200);
+      try {
+        const json = JSON.parse(raw);
+        message = json?.error?.message || json?.message || JSON.stringify(json).slice(0, 1200);
+      } catch {}
+      throw new Error(message || `HTTP ${upstream.status}`);
+    }
+
+    const contentType = upstream.headers.get("content-type") || "";
+    if (!contentType.includes("text/event-stream") || !upstream.body) {
+      const data = await upstream.json();
+      const image = extractImage(data);
+      if (!image) throw new Error("API 返回成功，但没有找到图片数据");
+      await completeGenerationTask(taskId, row, image, extractUsage(data), format, startedAt);
+      return;
+    }
+
+    keepaliveTimer = setInterval(() => {
+      setGenerationTaskProgress(taskId, 65, "后台任务仍在生成中", { elapsedMs: Date.now() - startedAt });
+    }, 25000);
+
+    const flush = (raw) => {
+      if (taskCancelRequested(taskId)) throw makeAbortError();
+      const event = parseSseEvent(raw);
+      if (!event) return;
+      eventCount += 1;
+      const { type, data } = event;
+      if (failedMessage) return;
+      if (data?.error) {
+        failedMessage = data.error.message || String(data.error);
+        setGenerationTaskProgress(taskId, 85, failedMessage, { eventType: type, eventCount });
+        return;
+      }
+      if (type === "response.failed") {
+        failedMessage = data?.response?.error?.message || data?.error?.message || "上游生成失败";
+        setGenerationTaskProgress(taskId, 85, failedMessage, { eventType: type, eventCount });
+        return;
+      }
+      const image = extractImage(data);
+      if (image) latestImage = image;
+      const usage = extractUsage(data);
+      if (usage) latestUsage = usage;
+      if (data?.response) finalResponse = data.response;
+      if (type === "response.completed") finalResponse = data.response || data;
+      const partial = typeof data?.partial_image_b64 === "string" ? data.partial_image_b64 : "";
+      const extra = {
+        eventType: type,
+        eventCount,
+        partialIndex: typeof data?.partial_image_index === "number" ? data.partial_image_index : null,
+        elapsedMs: Date.now() - startedAt,
+      };
+      if (partial && partial.length <= partialPreviewLimit) {
+        extra.partial = normalizeImageForClient(partial, format);
+      }
+      const ok = setGenerationTaskProgress(
+        taskId,
+        Math.min(88, Math.max(20, 20 + eventCount * 7)),
+        eventLabel(type, data),
+        extra,
+      );
+      if (!ok) throw makeAbortError();
+    };
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for await (const chunk of upstream.body) {
+      if (taskCancelRequested(taskId)) throw makeAbortError();
+      buffer += decoder.decode(chunk, { stream: true });
+      const parts = buffer.split(/\r?\n\r?\n/);
+      buffer = parts.pop() || "";
+      for (const part of parts) flush(part);
+    }
+    if (buffer.trim()) flush(buffer);
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
+    keepaliveTimer = null;
+
+    if (failedMessage) throw new Error(failedMessage);
+    if (!latestImage && finalResponse) {
+      latestImage = extractImage(finalResponse);
+      latestUsage = latestUsage || extractUsage(finalResponse);
+    }
+    if (!latestImage) throw new Error("流结束，但未能提取图片数据");
+    await completeGenerationTask(taskId, row, latestImage, latestUsage, format, startedAt);
+  } catch (error) {
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
+    const cancelled = error?.name === "AbortError" || controller.signal.aborted || taskCancelRequested(taskId);
+    if (cancelled) {
+      cancelGenerationTaskRecord(taskId, "用户取消了生成任务");
+    } else {
+      failGenerationTaskRecord(taskId, error?.message || String(error));
+    }
+  } finally {
+    generationWorkers.delete(taskId);
+  }
+}
+
+function scheduleGenerationTask(taskId) {
+  setTimeout(() => {
+    runGenerationTask(taskId).catch((error) => {
+      failGenerationTaskRecord(taskId, error?.message || String(error));
+    });
+  }, 0);
+}
+
+async function createGenerationTask(req, res, user) {
+  const input = await readJson(req);
+  const projectId = resolveProjectIdForUser(user, input.projectId || "");
+  const taskInput = { ...input, projectId };
+  const { cfg, payload, format } = buildImagePayload(taskInput);
+  if (!cfg.apiKey) {
+    sendJson(res, 400, { error: "missing API key in env" });
+    return;
+  }
+
+  let reservation = null;
+  try {
+    reservation = reserveGenerationCredit(user, taskInput);
+    const taskId = storageId("task");
+    const ts = nowMs();
+    const output = {
+      logs: [taskLogLine("后台生成任务已创建")],
+      quota: reservation.quota,
+      usageEventId: reservation.id,
+      model: payload.model,
+      toolModel: payload.tools[0].model,
+      size: payload.tools[0].size || "auto",
+      quality: payload.tools[0].quality,
+      format,
+    };
+    db.prepare(`
+      INSERT INTO generation_tasks (
+        id, project_id, owner_id, type, status, progress, input_json, output_json, error,
+        created_at, updated_at, started_at, finished_at, usage_event_id, cancel_requested
+      )
+      VALUES (?, ?, ?, 'image_generation', 'queued', 5, ?, ?, NULL, ?, ?, NULL, NULL, ?, 0)
+    `).run(
+      taskId,
+      projectId,
+      user.id,
+      JSON.stringify(taskInput),
+      JSON.stringify(output),
+      ts,
+      ts,
+      reservation.id,
+    );
+    scheduleGenerationTask(taskId);
+    sendJson(res, 202, { task: publicGenerationTask(generationTaskById(taskId)) });
+  } catch (error) {
+    if (reservation && !reservation.settled) refundGenerationCredit(reservation, error?.message || String(error));
+    throw error;
+  }
+}
+
+function getGenerationTask(req, res, user, taskId) {
+  const row = generationTaskById(taskId);
+  assertGenerationTaskAccess(user, row);
+  sendJson(res, 200, { task: publicGenerationTask(row) });
+}
+
+function cancelGenerationTask(req, res, user, taskId) {
+  const row = generationTaskById(taskId);
+  assertGenerationTaskAccess(user, row);
+  if (!isTerminalGenerationStatus(row.status)) {
+    updateGenerationTask(taskId, { cancelRequested: 1 });
+    const worker = generationWorkers.get(taskId);
+    if (worker?.controller) worker.controller.abort();
+  }
+  const task = cancelGenerationTaskRecord(taskId, "用户取消了生成任务") || publicGenerationTask(generationTaskById(taskId));
+  sendJson(res, 200, { task });
+}
+
+function recoverInterruptedGenerationTasks() {
+  const rows = db.prepare(`
+    SELECT id
+    FROM generation_tasks
+    WHERE status IN ('queued', 'running')
+  `).all();
+  for (const row of rows) {
+    failGenerationTaskRecord(row.id, "服务重启后任务已中断，请重新提交");
+  }
+}
+
+async function serveGeneratedFile(req, res, user, relPath) {
+  requireCurrentUser(req);
+  const cleanRelPath = String(relPath || "").replace(/^\/+/, "");
+  const filePath = resolve(generatedDir, cleanRelPath);
+  const allowedRoot = `${generatedDir}/`;
+  if (filePath !== generatedDir && !filePath.startsWith(allowedRoot)) {
+    sendJson(res, 403, { error: "forbidden" });
+    return;
+  }
+  const data = req.method === "HEAD" ? null : await readFile(filePath);
+  res.writeHead(200, {
+    "Content-Type": mimeType(filePath),
+    "Cache-Control": "private, max-age=31536000, immutable",
+  });
+  res.end(data);
+}
+
 async function proxyGenerate(req, res, user) {
   const input = await readJson(req);
   const { cfg, payload, format } = buildImagePayload(input);
@@ -2104,6 +2627,31 @@ async function route(req, res) {
         return;
       }
     }
+    if (req.method === "POST" && requestPath === "/api/generation-tasks") {
+      const user = requireCurrentUser(req);
+      await createGenerationTask(req, res, user);
+      return;
+    }
+    const generationTaskMatch = requestPath.match(/^\/api\/generation-tasks\/([^/]+)(?:\/([^/]+))?$/);
+    if (generationTaskMatch) {
+      const user = requireCurrentUser(req);
+      const taskId = decodeURIComponent(generationTaskMatch[1]);
+      const action = generationTaskMatch[2] ? decodeURIComponent(generationTaskMatch[2]) : "";
+      if (req.method === "GET" && !action) {
+        getGenerationTask(req, res, user, taskId);
+        return;
+      }
+      if (req.method === "POST" && action === "cancel") {
+        cancelGenerationTask(req, res, user, taskId);
+        return;
+      }
+    }
+    const generatedFileMatch = requestPath.match(/^\/api\/generated\/(.+)$/);
+    if ((req.method === "GET" || req.method === "HEAD") && generatedFileMatch) {
+      const user = requireCurrentUser(req);
+      await serveGeneratedFile(req, res, user, decodeURIComponent(generatedFileMatch[1]));
+      return;
+    }
     if (req.method === "POST" && requestPath === "/api/generate") {
       const user = requireCurrentUser(req);
       await proxyGenerate(req, res, user);
@@ -2147,6 +2695,7 @@ async function route(req, res) {
 }
 
 initializeStorage();
+recoverInterruptedGenerationTasks();
 
 const server = createServer(route);
 server.listen(defaultPort, () => {

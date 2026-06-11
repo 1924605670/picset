@@ -103,9 +103,9 @@ function imageMime(format) {
 
 function normalizeImageRef(image, format = "png") {
   if (!image) return "";
-  if (String(image).startsWith("data:")) return image;
-  if (/^https?:\/\//i.test(String(image))) return image;
-  return `data:${imageMime(format)};base64,${String(image).replace(/\s+/g, "")}`;
+  const ref = String(image);
+  if (/^(data:|https?:\/\/|blob:|\/|api\/|\.\/|\.\.\/)/i.test(ref)) return ref;
+  return `data:${imageMime(format)};base64,${ref.replace(/\s+/g, "")}`;
 }
 
 function toast(message) {
@@ -286,7 +286,10 @@ async function submitAuthCode() {
 }
 
 function resetWorkspaceState() {
-  for (const controller of state.activeTasks.values()) controller.abort();
+  for (const task of state.activeTasks.values()) {
+    if (typeof task?.abort === "function") task.abort();
+    else task?.controller?.abort?.();
+  }
   state.projects = [];
   state.conversations = [];
   state.messages = [];
@@ -365,6 +368,15 @@ async function loadWorkspaceAfterAuth() {
   await initConfig();
   renderAll();
   updateParamSummary();
+  resumePendingGenerationTasks();
+}
+
+function resumePendingGenerationTasks() {
+  for (const msg of state.messages) {
+    if (msg.status === "pending" && msg.taskId && !state.activeTasks.has(msg.id)) {
+      runGeneration(msg.id);
+    }
+  }
 }
 
 async function logoutCurrentUser() {
@@ -1185,63 +1197,179 @@ function updateMessageInDom(msgId) {
 async function runGeneration(msgId) {
   const msg = state.messages.find((item) => item.id === msgId);
   if (!msg) return;
+  const existing = state.activeTasks.get(msgId);
+  if (existing?.promise) return existing.promise;
+
+  const controller = new AbortController();
+  const taskState = { controller, taskId: msg.taskId || "", promise: null };
+  const promise = runGenerationTaskForMessage(msgId, taskState).finally(() => {
+    if (state.activeTasks.get(msgId) === taskState) state.activeTasks.delete(msgId);
+  });
+  taskState.promise = promise;
+  state.activeTasks.set(msgId, taskState);
+  return promise;
+}
+
+function generationRequestPayload(msg) {
+  return {
+    prompt: msg.requestPrompt || msg.sourcePrompt || msg.text || "",
+    images: msg.images || [],
+    size: msg.params?.size || "auto",
+    quality: msg.params?.quality || "high",
+    format: msg.params?.format || "png",
+    reasoning: msg.params?.reasoning || "off",
+    seed: msg.seed || 0,
+    model: STANDARD_IMAGE_MODEL,
+    apiBase: state.settings.apiBase || undefined,
+    projectId: msg.projectId || state.currentProjectId,
+    messageId: msg.id,
+  };
+}
+
+async function createGenerationTask(payload, signal) {
+  const res = await fetch("api/generation-tasks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  const data = await readApiJson(res, "创建后台生成任务失败");
+  return data.task;
+}
+
+async function fetchGenerationTask(taskId, signal) {
+  const res = await fetch(`api/generation-tasks/${encodeURIComponent(taskId)}`, { signal });
+  const data = await readApiJson(res, "读取生成任务失败");
+  return data.task;
+}
+
+async function requestCancelGenerationTask(taskId) {
+  const res = await fetch(`api/generation-tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST" });
+  const data = await readApiJson(res, "取消生成任务失败");
+  return data.task;
+}
+
+function makeClientAbortError(message = "用户取消了生成任务") {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+function applyTaskToPendingMessage(msg, task) {
+  if (!msg || !task) return;
+  const output = task.output || {};
+  msg.taskId = task.id;
+  if (Array.isArray(task.logs) && task.logs.length) msg.logs = task.logs.slice(-30);
+  if (output.quota && state.auth.user) {
+    state.auth.user.quota = output.quota;
+    renderAccount();
+  }
+  const partial = output.partial ? normalizeImageRef(output.partial, msg.params?.format) : msg.progress?.partial;
+  const label = output.label
+    || (task.status === "queued" ? "后台任务排队中" : task.status === "running" ? "后台生成中" : "等待生成");
+  msg.progress = {
+    ...(msg.progress || {}),
+    label,
+    percent: Math.max(8, Math.min(100, Number(task.progress || msg.progress?.percent || 12))),
+    partial,
+    partialIndex: output.partialIndex ?? msg.progress?.partialIndex ?? 0,
+  };
+}
+
+function taskToGenerationResult(task) {
+  const output = task?.output || {};
+  return {
+    image: output.image || output.imageUrl || "",
+    bytes: Number(output.bytes || 0),
+    usage: output.usage || null,
+    elapsedMs: output.elapsedMs || 0,
+    format: output.format || "png",
+    quota: output.quota || null,
+  };
+}
+
+async function pollGenerationTask(taskId, msgId, signal) {
+  let delay = 1200;
+  let pollFailures = 0;
+  while (true) {
+    let task = null;
+    try {
+      task = await fetchGenerationTask(taskId, signal);
+      pollFailures = 0;
+    } catch (error) {
+      if (signal?.aborted || error?.name === "AbortError") throw error;
+      pollFailures += 1;
+      const msg = state.messages.find((item) => item.id === msgId);
+      if (msg) {
+        if (pollFailures === 1 || pollFailures % 5 === 0) appendLog(msg, "进度连接中断，正在重连后台任务");
+        updateProgress(msgId, {
+          label: "正在重连后台任务",
+          percent: Math.max(msg.progress?.percent || 18, 18),
+        });
+        await updateMessage(msgId, msg);
+        updateMessageInDom(msgId);
+      }
+      await sleep(Math.min(5000, delay + pollFailures * 500));
+      continue;
+    }
+    const msg = state.messages.find((item) => item.id === msgId);
+    if (!msg) return task;
+    applyTaskToPendingMessage(msg, task);
+    await updateMessage(msgId, msg);
+    updateMessageInDom(msgId);
+
+    if (task.status === "succeeded") return task;
+    if (task.status === "failed") throw new Error(task.error || task.output?.error || "生成失败");
+    if (task.status === "cancelled") throw makeClientAbortError(task.error || "用户取消了生成任务");
+
+    await sleep(delay);
+    delay = Math.min(3000, delay + 300);
+  }
+}
+
+async function runGenerationTaskForMessage(msgId, taskState) {
+  const msg = state.messages.find((item) => item.id === msgId);
+  if (!msg) return;
   const maxAttempts = 1 + Number(state.settings.retries || 0);
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const controller = new AbortController();
-    const timeoutMs = Number(state.settings.timeoutMs || 0);
-    let timedOut = false;
-    let timeoutHandle = null;
-    if (timeoutMs > 0) {
-      timeoutHandle = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-      }, timeoutMs);
-    }
-    state.activeTasks.set(msgId, controller);
+    const taskId = taskState.taskId || msg.taskId || "";
     msg.status = "pending";
     msg.retryAttempt = attempt;
-    appendLog(msg, attempt === 0 ? "开始请求上游接口" : `自动重试第 ${attempt} 次`);
-    updateProgress(msgId, { label: attempt === 0 ? "请求发送中" : `自动重试中 ${attempt}/${maxAttempts - 1}`, percent: 12 });
+    appendLog(msg, taskId ? "恢复后台生成任务" : attempt === 0 ? "创建后台生成任务" : `自动重试第 ${attempt} 次`);
+    updateProgress(msgId, {
+      label: taskId ? "恢复后台任务轮询" : attempt === 0 ? "后台任务创建中" : `自动重试中 ${attempt}/${maxAttempts - 1}`,
+      percent: taskId ? Math.max(msg.progress?.percent || 18, 18) : 10,
+    });
     await updateMessage(msgId, msg);
 
     try {
-      const result = await postSse("api/generate", {
-        prompt: msg.requestPrompt || msg.sourcePrompt || msg.text || "",
-        images: msg.images || [],
-        size: msg.params?.size || "auto",
-        quality: msg.params?.quality || "high",
-        format: msg.params?.format || "png",
-        reasoning: msg.params?.reasoning || "off",
-        seed: msg.seed || 0,
-        model: STANDARD_IMAGE_MODEL,
-        apiBase: state.settings.apiBase || undefined,
-        projectId: msg.projectId || state.currentProjectId,
-        messageId: msg.id,
-      }, controller.signal, (event, data) => {
-        if (event === "log") {
-          appendLog(msg, data.label || data.type || "日志");
-          updateProgress(msgId, { label: data.label || "连接中", percent: Math.max(msg.progress?.percent || 16, 18) });
-        }
-        if (event === "progress") {
-          appendLog(msg, data.label || data.type || "进度事件");
-          const nextPercent = Math.min(88, Math.max(msg.progress?.percent || 20, 20 + (data.eventCount || 0) * 7));
-          const partial = data.partial ? normalizeImageRef(data.partial, msg.params?.format) : msg.progress?.partial;
-          updateProgress(msgId, { label: data.label || "生成中", percent: nextPercent, partial, partialIndex: data.partialIndex ?? msg.progress?.partialIndex ?? 0 });
-        }
-      });
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-      state.activeTasks.delete(msgId);
-      const image = normalizeImageRef(result.image, msg.params?.format);
+      let activeTaskId = taskId;
+      if (!activeTaskId) {
+        const created = await createGenerationTask(generationRequestPayload(msg), taskState.controller.signal);
+        activeTaskId = created.id;
+        taskState.taskId = activeTaskId;
+        applyTaskToPendingMessage(msg, created);
+        appendLog(msg, `后台任务 ${activeTaskId.slice(-8)} 已创建`);
+        await updateMessage(msgId, msg);
+        updateMessageInDom(msgId);
+      }
+
+      const task = await pollGenerationTask(activeTaskId, msgId, taskState.controller.signal);
+      const result = taskToGenerationResult(task);
+      const image = normalizeImageRef(result.image, result.format || msg.params?.format);
+      if (!image) throw new Error("后台任务完成，但没有返回图片地址");
       msg.status = "done";
       msg.image = image;
       msg.elapsedMs = result.elapsedMs;
       msg.usage = result.usage || null;
+      msg.taskId = activeTaskId;
       if (result.quota && state.auth.user) {
         state.auth.user.quota = result.quota;
         renderAccount();
       }
-      msg.bytes = estimateDataUrlBytes(image);
+      msg.bytes = result.bytes || estimateDataUrlBytes(image);
       msg.retryAttempt = 0;
+      msg.error = "";
       appendLog(msg, "生成完成");
       await updateMessage(msgId, msg);
       const galleryItem = await addGallery(image, msg.sourcePrompt || msg.text || "生成图片", msg.params, msg.folderId || activeOutputFolderId());
@@ -1252,9 +1380,7 @@ async function runGeneration(msgId) {
       renderGallery();
       return;
     } catch (error) {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-      state.activeTasks.delete(msgId);
-      const cancelled = error?.name === "AbortError" && !timedOut;
+      const cancelled = error?.name === "AbortError" || taskState.controller.signal.aborted;
       if (cancelled) {
         msg.status = "cancelled";
         msg.error = "用户取消了生成任务";
@@ -1262,15 +1388,19 @@ async function runGeneration(msgId) {
         updateMessageInDom(msgId);
         return;
       }
-      const message = timedOut ? "生成超过设置时间，已自动停止" : (error?.message || String(error));
+      const message = error?.message || String(error);
       appendLog(msg, message);
-      if (attempt + 1 < maxAttempts && isTransient(message, timedOut)) {
+      if (attempt + 1 < maxAttempts && isTransient(message, false)) {
         msg.retryAttempt = attempt + 1;
+        msg.taskId = "";
+        taskState.taskId = "";
         updateProgress(msgId, { label: `失败后准备自动重试 ${attempt + 1}/${maxAttempts - 1}`, percent: 10 });
+        await updateMessage(msgId, msg);
+        updateMessageInDom(msgId);
         await sleep(900);
         continue;
       }
-      msg.status = timedOut ? "timeout" : "error";
+      msg.status = "error";
       msg.error = `${message}${attempt > 0 ? `（已自动重试 ${attempt} 次）` : ""}`;
       await updateMessage(msgId, msg);
       updateMessageInDom(msgId);
@@ -1289,8 +1419,23 @@ function isTransient(message, timedOut) {
 }
 
 function cancelTask(msgId) {
-  const controller = state.activeTasks.get(msgId);
-  if (controller) controller.abort();
+  const active = state.activeTasks.get(msgId);
+  const msg = state.messages.find((item) => item.id === msgId);
+  const taskId = active?.taskId || msg?.taskId || "";
+  if (taskId) {
+    requestCancelGenerationTask(taskId).catch((error) => {
+      console.warn(error);
+    });
+  }
+  if (active?.controller) {
+    active.controller.abort();
+    return;
+  }
+  if (msg?.status === "pending") {
+    msg.status = "cancelled";
+    msg.error = "用户取消了生成任务";
+    updateMessage(msgId, msg).then(() => updateMessageInDom(msgId));
+  }
 }
 
 async function postSse(url, payload, signal, onEvent) {
@@ -1341,6 +1486,7 @@ function parseClientSse(raw) {
 }
 
 function estimateDataUrlBytes(dataUrl) {
+  if (!String(dataUrl || "").startsWith("data:")) return 0;
   const body = String(dataUrl).split(",")[1] || "";
   return Math.floor(body.length * 0.75);
 }
@@ -2477,10 +2623,10 @@ function bindEvents() {
     if (event.key === "Escape") {
       for (const id of ["admin-modal", "settings-modal", "projects-modal", "gallery-picker-modal", "folder-picker-modal", "folder-create-modal", "storyboard-modal", "edit-modal", "mark-modal", "assets-modal"]) closeModal(id);
       setSidebarOpen(false);
-      for (const [msgId, controller] of state.activeTasks) {
+      for (const [msgId] of state.activeTasks) {
         const msg = state.messages.find((item) => item.id === msgId);
         if (msg?.status === "pending") {
-          controller.abort();
+          cancelTask(msgId);
           break;
         }
       }
