@@ -13,7 +13,13 @@ const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 function parseEnvFile(path) {
   if (!path || !existsSync(path)) return {};
   const values = {};
-  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+  let content = "";
+  try {
+    content = readFileSync(path, "utf8");
+  } catch {
+    return {};
+  }
+  for (const line of content.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) continue;
     const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
