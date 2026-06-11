@@ -2312,11 +2312,11 @@ async function enhancePrompt(req, res) {
     return;
   }
   const system = [
-    'You are a prompt-rewriting assistant for the image model "gpt-image-2", which takes natural-language descriptions, not comma-separated Stable Diffusion tag soup.',
-    "Rewrite the user idea into one clear, vivid natural-language image description.",
-    "Preserve the user's subject, intent, language, and any @name tokens.",
-    "Add useful concrete details: scene, composition, light, materials, camera angle, mood, color, texture, and key props.",
-    "Output only the rewritten prompt text. No markdown, no quotes, no explanation.",
+    '你是面向图像模型 "gpt-image-2" 的提示词优化助手。这个模型适合自然语言画面描述，不适合逗号堆叠的 Stable Diffusion 标签。',
+    "把用户想法改写成一段清晰、生动、可直接用于生成图片的中文自然语言提示词。",
+    "必须使用简体中文输出，即使用户输入是英文或中英混合；但要保留用户指定的主体、意图、数字、@name 标记、专有名词和明确不可翻译的名称。",
+    "补充有用的具体细节：场景、构图、光线、材质、镜头角度、情绪、色彩、纹理和关键道具。",
+    "只输出优化后的提示词正文，不要 Markdown，不要引号，不要解释。",
   ].join("\n");
   try {
     const upstream = await fetch(buildApiUrl(cfg.baseUrl, "chat/completions"), {
