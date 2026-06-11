@@ -1,0 +1,109 @@
+name: Production Smoke Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Prompt used for the production image generation smoke test"
+        required: false
+        type: string
+      size:
+        description: "Image size"
+        required: false
+        default: "3840x2160"
+        type: choice
+        options:
+          - "3840x2160"
+          - "2160x3840"
+          - "2048x2048"
+      quality:
+        description: "Image quality"
+        required: false
+        default: "high"
+        type: choice
+        options:
+          - "high"
+          - "medium"
+          - "low"
+          - "auto"
+      format:
+        description: "Image format"
+        required: false
+        default: "png"
+        type: choice
+        options:
+          - "png"
+          - "jpeg"
+          - "webp"
+      timeout_seconds:
+        description: "Maximum wait time"
+        required: false
+        default: "1500"
+        type: string
+
+jobs:
+  production-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check deployment secrets
+        shell: bash
+        env:
+          TENCENT_HOST: ${{ secrets.TENCENT_HOST }}
+          TENCENT_USER: ${{ secrets.TENCENT_USER }}
+          TENCENT_PASSWORD: ${{ secrets.TENCENT_PASSWORD }}
+        run: |
+          for name in TENCENT_HOST TENCENT_USER TENCENT_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "$name is required" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install SSH tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Trust server host key
+        shell: bash
+        env:
+          SSHPASS: ${{ secrets.TENCENT_PASSWORD }}
+          TENCENT_HOST: ${{ secrets.TENCENT_HOST }}
+          TENCENT_USER: ${{ secrets.TENCENT_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$TENCENT_HOST" >> ~/.ssh/known_hosts
+          sshpass -e ssh -o StrictHostKeyChecking=yes "$TENCENT_USER@$TENCENT_HOST" "true"
+
+      - name: Upload smoke script
+        shell: bash
+        env:
+          SSHPASS: ${{ secrets.TENCENT_PASSWORD }}
+          TENCENT_HOST: ${{ secrets.TENCENT_HOST }}
+          TENCENT_USER: ${{ secrets.TENCENT_USER }}
+        run: |
+          sshpass -e scp scripts/production_smoke_test.mjs "$TENCENT_USER@$TENCENT_HOST:/tmp/picset-production-smoke.mjs"
+
+      - name: Run production smoke test
+        shell: bash
+        env:
+          SSHPASS: ${{ secrets.TENCENT_PASSWORD }}
+          TENCENT_HOST: ${{ secrets.TENCENT_HOST }}
+          TENCENT_USER: ${{ secrets.TENCENT_USER }}
+          PROMPT: ${{ inputs.prompt }}
+          SIZE: ${{ inputs.size }}
+          QUALITY: ${{ inputs.quality }}
+          FORMAT: ${{ inputs.format }}
+          TIMEOUT_SECONDS: ${{ inputs.timeout_seconds }}
+        run: |
+          if [ -z "$PROMPT" ]; then
+            PROMPT="一张横版 4K 电影感动漫场景：一只橘猫和一只白色小狗在明亮厨房里进行搞笑料理比赛，面粉飞在空中，番茄滚落，表情夸张但可爱，高细节，干净构图，温暖日光，适合动画剧集封面，不要文字、水印或标志。"
+          fi
+          PROMPT_B64="$(printf '%s' "$PROMPT" | base64 -w 0)"
+          TIMEOUT_MS="$(( ${TIMEOUT_SECONDS:-1500} * 1000 ))"
+          sshpass -e ssh -o StrictHostKeyChecking=yes "$TENCENT_USER@$TENCENT_HOST" \
+            "cd /opt/picset && PICSET_SMOKE_PROMPT_B64='$PROMPT_B64' PICSET_SMOKE_SIZE='${SIZE:-3840x2160}' PICSET_SMOKE_QUALITY='${QUALITY:-high}' PICSET_SMOKE_FORMAT='${FORMAT:-png}' PICSET_SMOKE_TIMEOUT_MS='$TIMEOUT_MS' node /tmp/picset-production-smoke.mjs"
