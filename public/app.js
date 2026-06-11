@@ -88,6 +88,7 @@ const ANCHOR_TYPES = [
 
 const STORYBOARD_REFERENCE_TEXT = "生成核心参考图";
 const STORYBOARD_START_TEXT = "继续生成剧情图";
+const STORYBOARD_MAX_FRAME_REFERENCES = 8;
 
 function uid(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1135,7 +1136,7 @@ function applyOptionChip(btn) {
   const current = target.value.trim();
   if (mode === "replace" || !current) {
     target.value = text;
-  } else {
+  } else if (!current.includes(text)) {
     const isTextarea = target.tagName === "TEXTAREA";
     const sep = isTextarea ? (target.value.endsWith("\n") ? "" : "\n") : "，";
     target.value = `${target.value}${sep}${text}`;
@@ -1481,7 +1482,7 @@ function cancelTask(msgId) {
   }
 }
 
-async function postSse(url, payload, signal, onEvent) {
+async function postSse(url, payload, signal, onEvent, resultLabel = "结果") {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1513,7 +1514,7 @@ async function postSse(url, payload, signal, onEvent) {
       else onEvent?.(parsed.event, parsed.data);
     }
   }
-  if (!finalResult) throw new Error("连接结束，但没有收到结果图");
+  if (!finalResult) throw new Error(`连接结束，但没有收到${resultLabel}`);
   return finalResult;
 }
 
@@ -1981,15 +1982,26 @@ async function planStoryboard() {
   $("#storyboard-plan-btn").disabled = true;
   state.storyboard.busy = "plan";
   updateStoryboardControls("plan");
-  $("#storyboard-plan-btn").textContent = "规划中";
-  $("#storyboard-status").textContent = "正在规划角色、关键对象、核心主题和分镜...";
+  $("#storyboard-plan-btn").textContent = "实时规划中";
+  $("#storyboard-status").textContent = "正在连接大模型，实时规划角色、关键对象、核心主题和分镜...";
   try {
-    const res = await fetch("api/storyboard", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ story, count, style, continuity, anchors, apiBase: state.settings.apiBase || undefined, enhanceModel: selectedEnhanceModel() }),
-    });
-    const data = await readApiJson(res, "剧情拆分失败");
+    let preview = "";
+    const data = await postSse(
+      "api/storyboard",
+      { story, count, style, continuity, anchors, apiBase: state.settings.apiBase || undefined, enhanceModel: selectedEnhanceModel(), stream: true },
+      undefined,
+      (event, payload) => {
+        if (event === "status" && payload?.label) {
+          $("#storyboard-status").textContent = payload.label;
+          return;
+        }
+        if (event === "delta") {
+          preview = String(payload?.preview || `${preview}${payload?.text || ""}`).slice(-220);
+          $("#storyboard-status").textContent = `大模型实时返回中：${preview}`;
+        }
+      },
+      "分镜规划结果",
+    );
     state.storyboard = {
       title: data.title || "连续出图",
       anchors: mergeStoryboardAnchors(Array.isArray(data.anchors) ? data.anchors : [], previousAnchors),
@@ -2009,7 +2021,7 @@ async function planStoryboard() {
     updateStoryboardControls("plan");
   } finally {
     $("#storyboard-plan-btn").disabled = false;
-    $("#storyboard-plan-btn").textContent = "规划核心与剧情";
+    $("#storyboard-plan-btn").textContent = "实时规划核心与剧情";
     state.storyboard.busy = "";
     updateStoryboardControls();
   }
@@ -2095,7 +2107,7 @@ function storyboardReferenceImages(anchors = currentStoryboardAnchors()) {
   return anchors.map((anchor) => anchor.image).filter(Boolean);
 }
 
-function frameReferenceImages(frame, anchors = currentStoryboardAnchors(), maxRefs = 3) {
+function frameReferenceImages(frame, anchors = currentStoryboardAnchors(), maxRefs = STORYBOARD_MAX_FRAME_REFERENCES) {
   const text = `${frame.title || ""}\n${frame.beat || ""}\n${frame.prompt || ""}`.toLowerCase();
   const scored = anchors
     .filter((anchor) => anchor.image)
@@ -2105,6 +2117,7 @@ function frameReferenceImages(frame, anchors = currentStoryboardAnchors(), maxRe
       let score = 0;
       if (name && text.includes(name)) score += 4;
       if (type && text.includes(type)) score += 1;
+      if (anchor.type === "theme") score += 3;
       if (anchor.type === "character") score += 2;
       if (anchor.type === "object") score += 1.5;
       if (anchor.type === "location" && /room|scene|stage|living|apartment|interior|客厅|场景|地点/.test(text)) score += 1;
@@ -2175,6 +2188,21 @@ function storyboardAnchorBlock(anchors = currentStoryboardAnchors()) {
     ].filter(Boolean);
     return parts.join("；");
   }).join("\n");
+}
+
+function storyboardStyleLockBlock(style = $("#storyboard-style")?.value.trim() || "", continuity = $("#storyboard-continuity")?.value.trim() || "") {
+  return [
+    "【全局风格锁，第一张到最后一张都必须一致】",
+    style ? `统一画风：${style}` : "",
+    continuity ? `连续性要求：${continuity}` : "",
+    "所有核心参考图和剧情图必须保持同一套画风、线条或摄影语言、色彩基调、材质质感、光线方向、镜头审美和画面精细度。",
+    "允许剧情动作和镜头角度变化，但不要改变角色身份、服装标志、核心道具形状、主题符号或整体美术风格。",
+  ].filter(Boolean).join("\n");
+}
+
+function orderedStoryboardAnchorsForGeneration(anchors) {
+  const priority = { theme: 0, character: 1, object: 2, location: 3 };
+  return [...anchors].sort((a, b) => (priority[a.type] ?? 9) - (priority[b.type] ?? 9) || a.sourceIndex - b.sourceIndex);
 }
 
 function renderStoryboardAnchors() {
@@ -2270,19 +2298,20 @@ function anchorReferencePrompt(anchor, style) {
   }[anchor.type] || "生成清晰参考图，主体和视觉特征稳定。";
   return [
     `【核心参考图】${type}：${anchor.name}`,
+    storyboardStyleLockBlock(style, $("#storyboard-continuity")?.value.trim() || ""),
     anchor.description ? `固定设定：${anchor.description}` : "",
     anchor.visualLock ? `视觉锁定：${anchor.visualLock}` : "",
-    style ? `视觉风格：${style}` : "",
     typeGuide,
-    "这张图会作为后续剧情分镜的参考图使用，因此主体必须清晰、稳定、可复用。不要生成文字、水印或多余说明。",
+    "这张图会作为后续剧情分镜的参考图使用，因此主体必须清晰、完整展示、稳定、可复用。不要生成文字、水印或多余说明。",
   ].filter(Boolean).join("\n");
 }
 
 async function generateStoryboardAnchorImages(conv, folder, anchors) {
   const style = $("#storyboard-style").value.trim();
   const generated = [];
-  for (let i = 0; i < anchors.length; i++) {
-    const anchor = anchors[i];
+  const orderedAnchors = orderedStoryboardAnchorsForGeneration(anchors);
+  for (let i = 0; i < orderedAnchors.length; i++) {
+    const anchor = orderedAnchors[i];
     const index = anchor.sourceIndex;
     if (anchor.image) {
       generated.push(anchor.image);
@@ -2291,20 +2320,24 @@ async function generateStoryboardAnchorImages(conv, folder, anchors) {
     state.storyboard.anchors[index].status = "pending";
     state.storyboard.anchors[index].error = "";
     renderStoryboardAnchors();
-    $("#storyboard-status").textContent = `正在生成核心参考图 ${i + 1}/${anchors.length}：${anchor.name}`;
-    const prompt = anchorReferencePrompt(anchor, style);
+    $("#storyboard-status").textContent = `正在生成核心参考图 ${i + 1}/${orderedAnchors.length}：${anchor.name}`;
+    const previousRefs = generated.slice(0, STORYBOARD_MAX_FRAME_REFERENCES);
+    const prompt = [
+      previousRefs.length ? `已附加 ${previousRefs.length} 张前序核心参考图。请严格沿用它们的画风、色调、光线和质感，只新增当前参考主体。` : "",
+      anchorReferencePrompt(anchor, style),
+    ].filter(Boolean).join("\n");
     const botMsg = await addMessage({
       role: "bot",
       conversationId: conv.id,
       sourcePrompt: `核心参考图：${anchor.name}`,
       requestPrompt: expandAssets(prompt),
-      images: [],
+      images: previousRefs,
       params: getParams(),
       seed: getSeed(),
       folderId: folder.id,
       status: "pending",
-      logs: [`核心参考图 ${i + 1}/${anchors.length} 已排队`],
-      progress: { label: `准备生成核心参考图 ${i + 1}/${anchors.length}`, percent: 8 },
+      logs: [`核心参考图 ${i + 1}/${orderedAnchors.length} 已排队`],
+      progress: { label: `准备生成核心参考图 ${i + 1}/${orderedAnchors.length}`, percent: 8 },
     });
     renderChat();
     await runGeneration(botMsg.id);
@@ -2422,22 +2455,25 @@ async function startStoryboardGeneration() {
     renderAll();
 
     for (const frame of frames) {
-      const frameImages = frameReferenceImages(frame, anchors, 3);
+      const frameImages = frameReferenceImages(frame, anchors, STORYBOARD_MAX_FRAME_REFERENCES);
+      const styleLock = storyboardStyleLockBlock();
       const prompt = [
         `【连续出图 ${frame.index}/${frames.length}】${frame.title || `画面 ${frame.index}`}`,
-        `已附加 ${frameImages.length} 张相关核心参考图。生成时必须参考这些图片中的角色、对象、场景或主题，不要重新发明外观。`,
+        `已附加 ${frameImages.length} 张核心参考图。生成时必须同时参考这些图片中的角色、对象、场景和主题风格，不要重新发明外观。`,
+        styleLock,
         "【核心设定，所有画面必须严格遵守】",
         anchorBlock,
         frame.beat ? `剧情节点：${frame.beat}` : "",
+        "【本帧中文提示词】",
         frame.prompt,
-        "保持核心设定中的人物、对象、场景、光线和色调连续。不要改变角色身份、服装标志、核心道具形状或主题视觉符号。不要添加无关主体。",
+        "最终画面必须和前后分镜保持同一世界观、同一美术风格和同一角色/对象设定。不要改变角色身份、服装标志、核心道具形状或主题视觉符号。不要添加无关主体。",
       ].filter(Boolean).join("\n");
       const botMsg = await addMessage({
         role: "bot",
         conversationId: conv.id,
         sourcePrompt: frame.prompt,
         requestPrompt: expandAssets(prompt),
-        images: frameImages.length ? frameImages : referenceImages.slice(0, 3),
+        images: frameImages.length ? frameImages : referenceImages.slice(0, STORYBOARD_MAX_FRAME_REFERENCES),
         params: getParams(),
         seed: getSeed(),
         folderId: folder.id,

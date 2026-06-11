@@ -2361,8 +2361,8 @@ async function enhancePrompt(req, res) {
         stream: false,
       }),
     });
-    const raw = await upstream.text();
     if (!upstream.ok) {
+      const raw = await upstream.text();
       let message = raw.slice(0, 800);
       try {
         const json = JSON.parse(raw);
@@ -2371,6 +2371,7 @@ async function enhancePrompt(req, res) {
       sendJson(res, upstream.status, { error: message });
       return;
     }
+    const raw = await upstream.text();
     const data = JSON.parse(raw);
     const text = cleanModelResponseText(chatContentText(data?.choices?.[0]?.message?.content));
     sendJson(res, 200, { prompt: text, model: cfg.enhanceModel });
@@ -2432,22 +2433,38 @@ function normalizeStoryboardAnchors(data, fallback = {}) {
     const visualLock = String(item?.visualLock || item?.lock || item?.prompt || item?.constraint || "").trim();
     return { type, name, description, visualLock };
   }).filter((item) => item.name && (item.description || item.visualLock));
-  if (anchors.length) return anchors.slice(0, 8);
+  if (anchors.length) {
+    const hasTheme = anchors.some((item) => item.type === "theme" && /风格|画风|视觉|主题|色调|style/i.test(`${item.name}\n${item.description}\n${item.visualLock}`));
+    if (!hasTheme) {
+      anchors.unshift({
+        type: "theme",
+        name: "全局风格锁",
+        description: fallback.style || "连续画面的统一视觉风格",
+        visualLock: [
+          fallback.style ? `统一画风：${fallback.style}` : "",
+          fallback.continuity ? `连续性要求：${fallback.continuity}` : "",
+          "所有核心参考图和剧情分镜保持同一套画风、色彩基调、光线方向、镜头审美、材质质感和画面精细度。",
+        ].filter(Boolean).join("；"),
+      });
+    }
+    return anchors.slice(0, 8);
+  }
   return [{
     type: "theme",
-    name: "整体连续性",
+    name: "全局风格锁",
     description: fallback.style || fallback.story || "连续画面的统一视觉设定",
-    visualLock: fallback.continuity || "所有画面保持同一人物、服饰、核心道具、场景线索、光线和色调连续。",
+    visualLock: fallback.continuity || "所有画面保持同一人物、服饰、核心道具、场景线索、光线、画风和色调连续。",
   }];
 }
 
-async function buildStoryboard(req, res) {
-  const input = await readJson(req);
+function extractChatDeltaText(data) {
+  const choice = data?.choices?.[0] || {};
+  const delta = choice.delta?.content ?? choice.message?.content ?? "";
+  return chatContentText(delta);
+}
+
+function buildStoryboardCompletion(input = {}) {
   const cfg = getRuntimeConfig(input || {});
-  if (!cfg.apiKey) {
-    sendJson(res, 400, { error: "missing API key in env" });
-    return;
-  }
   const count = Math.max(1, Math.min(24, Number(input.count || 6)));
   const style = String(input.style || "电影感").trim();
   const story = String(input.story || "").trim();
@@ -2460,18 +2477,15 @@ async function buildStoryboard(req, res) {
     const visualLock = String(anchor?.visualLock || "").trim();
     return `${index + 1}. [${type}] ${name}: ${description}${visualLock ? `；视觉锁定：${visualLock}` : ""}`;
   }).filter(Boolean).join("\n");
-  if (!story) {
-    sendJson(res, 400, { error: "story is required" });
-    return;
-  }
   const system = [
-    "You are a senior visual storyboard designer and image prompt writer.",
-    "First design stable continuity anchors, then expand the user's story into a coherent sequence of image-generation frames.",
-    "Continuity anchors are recurring characters, key objects, important locations, or visual themes that must stay consistent across every generated image.",
-    "Each frame must follow the previous frame logically and preserve the anchors exactly: character appearance, clothing, props, setting details, color palette, and lighting direction.",
-    "Write prompts as natural-language image descriptions, not comma-separated tag lists.",
-    "Do not output <think> tags, reasoning, analysis, or any text outside the JSON object.",
-    "Return strict JSON only. No markdown.",
+    "你是资深中文视觉分镜导演和图像提示词设计师。",
+    "你的任务是先设计稳定的核心参考项，再把用户剧情扩展成连贯的连续出图分镜。",
+    "必须使用简体中文输出；除用户提供的专有名词、角色名、品牌名、@标记外，不要输出英文。",
+    "anchors 是后续要先生成的核心参考图，必须可视化、可复用、可锁定一致性。",
+    "frames[].prompt 必须是中文自然语言画面描述，不要写成英文，不要写逗号堆叠标签。",
+    "每一帧都必须严格继承全局画风、色彩基调、光线方向、镜头审美、角色外观、服装、道具形状、场景结构和主题符号。",
+    "不要输出 <think> 标签、推理过程、分析过程或 JSON 外的任何文字。",
+    "只返回严格 JSON，不要 Markdown。",
     'Schema: {"title":"短标题","anchors":[{"type":"character|object|location|theme","name":"名称","description":"固定设定","visualLock":"每张图必须遵守的视觉锁定描述"}],"frames":[{"title":"短标题","beat":"剧情节点","prompt":"适合图像生成的自然语言画面描述"}]}',
   ].join("\n");
   const user = [
@@ -2481,57 +2495,198 @@ async function buildStoryboard(req, res) {
     continuity ? `连续性要求：${continuity}` : "",
     userAnchorText ? `用户已指定的核心设定：\n${userAnchorText}` : "",
     "要求：",
-    "- 先创建 3 到 8 个 anchors，至少包含主要角色；如果剧情没有人物，则包含核心对象、地点或主题。",
+    "- 先创建 3 到 8 个 anchors，必须包含一个 theme 类型的“全局风格锁”；如果剧情有人物，必须包含主要角色；如果剧情没有人物，则包含核心对象、地点或主题。",
     "- 如果用户已指定核心设定，必须保留这些设定，只能补充更精确的视觉锁定细节。",
     "- anchors 必须具体到外观、服装、材质、颜色、标志性细节、比例、环境或色调，不要写抽象词。",
-    "- 每一帧 prompt 必须显式引用相关 anchors 的稳定特征，避免人物、对象或主题漂移。",
+    "- 每一帧 prompt 必须显式写入全局画风和相关 anchors 的稳定特征，避免人物、对象、场景或主题漂移。",
     "- 每一帧必须是独立可生成的完整画面描述。",
-    "- 每帧都包含主体、动作、环境、构图、光线、镜头、情绪和必要的连续性信息。",
+    "- 每帧都包含主体、动作、环境、构图、光线、镜头、情绪和必要的连续性信息，并说明与上一帧的剧情承接。",
+    "- 所有 title、beat、prompt、description、visualLock 都必须是中文。",
     "- 不要生成暴力血腥、色情或违法内容。",
     `- 严格返回 ${count} 个 frames。`,
   ].filter(Boolean).join("\n");
+  return {
+    cfg,
+    count,
+    story,
+    style,
+    continuity,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  };
+}
+
+function storyboardResultFromContent(content, plan) {
+  const parsed = parseStoryboardJson(content);
+  const frames = normalizeStoryboard(parsed, plan.count);
+  const anchors = normalizeStoryboardAnchors(parsed, { story: plan.story, style: plan.style, continuity: plan.continuity });
+  if (!frames.length) throw new Error("model returned no usable frames");
+  return {
+    title: String(parsed?.title || "连续出图").trim(),
+    anchors,
+    frames,
+    model: plan.cfg.enhanceModel,
+  };
+}
+
+async function fetchStoryboardCompletionContent(plan, options = {}) {
+  const upstream = await fetch(buildApiUrl(plan.cfg.baseUrl, "chat/completions"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${plan.cfg.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: plan.cfg.enhanceModel,
+      messages: plan.messages,
+      temperature: 0.65,
+      stream: false,
+    }),
+    signal: options.signal,
+  });
+  const raw = await upstream.text();
+  if (!upstream.ok) {
+    let message = raw.slice(0, 800);
+    try {
+      const json = JSON.parse(raw);
+      message = json?.error?.message || json?.message || message;
+    } catch {}
+    throw new Error(message || `storyboard request failed: ${upstream.status}`);
+  }
+  const data = JSON.parse(raw);
+  return chatContentText(data?.choices?.[0]?.message?.content);
+}
+
+async function streamStoryboard(req, res, plan) {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  const controller = new AbortController();
+  req.on("close", () => controller.abort());
+  sseSend(res, "status", { label: `正在请求 ${plan.cfg.enhanceModel} 实时规划分镜...` });
+
   try {
-    const upstream = await fetch(buildApiUrl(cfg.baseUrl, "chat/completions"), {
+    const upstream = await fetch(buildApiUrl(plan.cfg.baseUrl, "chat/completions"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${cfg.apiKey}`,
+        "Authorization": `Bearer ${plan.cfg.apiKey}`,
+        "Accept": "text/event-stream",
       },
       body: JSON.stringify({
-        model: cfg.enhanceModel,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
+        model: plan.cfg.enhanceModel,
+        messages: plan.messages,
         temperature: 0.65,
-        stream: false,
+        stream: true,
       }),
+      signal: controller.signal,
     });
-    const raw = await upstream.text();
     if (!upstream.ok) {
+      const raw = await upstream.text();
       let message = raw.slice(0, 800);
       try {
         const json = JSON.parse(raw);
         message = json?.error?.message || json?.message || message;
       } catch {}
-      sendJson(res, upstream.status, { error: message });
+      sseSend(res, "error", { status: upstream.status, message });
+      res.end();
       return;
     }
-    const data = JSON.parse(raw);
-    const content = chatContentText(data?.choices?.[0]?.message?.content);
-    const parsed = parseStoryboardJson(content);
-    const frames = normalizeStoryboard(parsed, count);
-    const anchors = normalizeStoryboardAnchors(parsed, { story, style, continuity });
-    if (!frames.length) {
-      sendJson(res, 502, { error: "model returned no usable frames" });
+    const contentType = upstream.headers.get("content-type") || "";
+    if (!contentType.includes("text/event-stream") || !upstream.body) {
+      const raw = await upstream.text();
+      const data = JSON.parse(raw);
+      const content = chatContentText(data?.choices?.[0]?.message?.content);
+      const result = storyboardResultFromContent(content, plan);
+      sseSend(res, "result", result);
+      res.end();
       return;
     }
-    sendJson(res, 200, {
-      title: String(parsed?.title || "连续出图").trim(),
-      anchors,
-      frames,
-      model: cfg.enhanceModel,
-    });
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let content = "";
+    let eventCount = 0;
+    let failedMessage = "";
+    const flush = (eventRaw) => {
+      const event = parseSseEvent(eventRaw);
+      if (!event || event.type === "done") return;
+      const data = event.data;
+      if (failedMessage) return;
+      if (data?.error) {
+        failedMessage = data.error.message || String(data.error);
+        sseSend(res, "error", { message: failedMessage });
+        return;
+      }
+      eventCount += 1;
+      const delta = extractChatDeltaText(data);
+      if (delta) {
+        content += delta;
+        sseSend(res, "delta", {
+          text: delta,
+          preview: cleanModelResponseText(content).slice(-260),
+          eventCount,
+        });
+        return;
+      }
+      if (eventCount === 1 || eventCount % 50 === 0) {
+        sseSend(res, "status", { label: `大模型正在规划分镜... ${eventCount}` });
+      }
+    };
+
+    for await (const chunk of upstream.body) {
+      buffer += decoder.decode(chunk, { stream: true });
+      const parts = buffer.split(/\r?\n\r?\n/);
+      buffer = parts.pop() || "";
+      for (const part of parts) flush(part);
+    }
+    if (buffer.trim()) flush(buffer);
+    if (failedMessage) {
+      res.end();
+      return;
+    }
+
+    const result = storyboardResultFromContent(content, plan);
+    sseSend(res, "result", result);
+    res.end();
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+    if (controller.signal.aborted || res.writableEnded) return;
+    try {
+      sseSend(res, "status", { label: "实时连接中断，正在切换为稳定规划..." });
+      const content = await fetchStoryboardCompletionContent(plan, { signal: controller.signal });
+      const result = storyboardResultFromContent(content, plan);
+      sseSend(res, "result", { ...result, fallback: true });
+    } catch (fallbackError) {
+      sseSend(res, "error", { message: fallbackError?.message || error?.message || String(error) });
+    }
+    res.end();
+  }
+}
+
+async function buildStoryboard(req, res) {
+  const input = await readJson(req);
+  const plan = buildStoryboardCompletion(input);
+  if (!plan.cfg.apiKey) {
+    sendJson(res, 400, { error: "missing API key in env" });
+    return;
+  }
+  if (!plan.story) {
+    sendJson(res, 400, { error: "story is required" });
+    return;
+  }
+  if (input?.stream) {
+    await streamStoryboard(req, res, plan);
+    return;
+  }
+  try {
+    const content = await fetchStoryboardCompletionContent(plan);
+    sendJson(res, 200, storyboardResultFromContent(content, plan));
   } catch (error) {
     sendJson(res, 500, { error: error?.message || String(error) });
   }
