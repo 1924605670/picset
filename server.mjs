@@ -1604,11 +1604,13 @@ function extractUsage(data) {
 
 function eventLabel(type, data) {
   const item = data?.item;
+  if (/keepalive/i.test(type || "")) return "后台任务仍在生成中";
   if (/partial_image/i.test(type || "")) return "收到部分预览图";
   if (/image_generation_call\.completed$/i.test(type || "")) return "图片渲染完成";
   if (/image_generation_call\.in_progress/i.test(type || "")) return "图片渲染中";
   if (/image_generation_call\.generating/i.test(type || "")) return "图片生成中";
   if (/output_item\.added$/i.test(type || "") && item?.type === "image_generation_call") return "开始渲染图片";
+  if (/output_item\.done$/i.test(type || "")) return item?.type === "image_generation_call" ? "图片渲染完成" : "输出处理完成";
   if (/response\.created/i.test(type || "")) return "请求已创建";
   if (/response\.in_progress/i.test(type || "")) return "上游正在处理";
   if (/response\.completed/i.test(type || "")) return "生成完成";
@@ -1802,9 +1804,11 @@ function generationTaskReservation(row) {
 function setGenerationTaskProgress(taskId, progress, label = "", extra = {}) {
   const row = generationTaskById(taskId);
   if (!row || isTerminalGenerationStatus(row.status) || Number(row.cancelRequested || 0) === 1) return false;
+  const currentProgress = Math.max(0, Math.min(99, Math.floor(Number(row.progress || 0))));
+  const requestedProgress = Math.max(0, Math.min(99, Math.floor(Number(progress || 0))));
   updateGenerationTaskOutput(taskId, (output) => appendGenerationTaskLog({ ...output, ...extra, label }, label), {
     status: "running",
-    progress: Math.max(0, Math.min(99, Math.floor(Number(progress || 0)))),
+    progress: Math.max(currentProgress, requestedProgress),
   });
   return true;
 }
